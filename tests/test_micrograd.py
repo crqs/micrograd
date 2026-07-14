@@ -1,9 +1,14 @@
 import torch
-from micrograd.engine import Value
+
+from micrograd import Tensor
+
 
 def test_sanity_check():
+    """
+    Test that the micrograd engine produces the same results as PyTorch for a simple computation graph.
+    """
 
-    x = Value(-4.0)
+    x = Tensor(-4.0)
     z = 2 * x + 2 + x
     q = z.relu() + z * x
     h = (z * z).relu()
@@ -25,10 +30,11 @@ def test_sanity_check():
     # backward pass went well
     assert xmg.grad == xpt.grad.item()
 
+
 def test_more_ops():
 
-    a = Value(-4.0)
-    b = Value(2.0)
+    a = Tensor(-4.0)
+    b = Tensor(2.0)
     c = a + b
     d = a * b + b**3
     c += c + 1

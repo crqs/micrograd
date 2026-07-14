@@ -1,60 +1,81 @@
-import random
-from micrograd.engine import Value
+from abc import ABC, abstractmethod
+from itertools import pairwise
+from typing import Literal
 
-class Module:
+import numpy as np
 
-    def zero_grad(self):
-        for p in self.parameters():
-            p.grad = 0
+from .tensor import Tensor
 
-    def parameters(self):
-        return []
 
-class Neuron(Module):
+class Module(ABC):
+    @property
+    @abstractmethod
+    def parameters(self) -> list[Tensor]: ...
 
-    def __init__(self, nin, nonlin=True):
-        self.w = [Value(random.uniform(-1,1)) for _ in range(nin)]
-        self.b = Value(0)
-        self.nonlin = nonlin
+    @property
+    def nb_parameters(self) -> int:
+        return sum(p.data.size for p in self.parameters)
 
-    def __call__(self, x):
-        act = sum((wi*xi for wi,xi in zip(self.w, x)), self.b)
-        return act.relu() if self.nonlin else act
+    def zero_grad(self) -> None:
+        for p in self.parameters:
+            p.grad = np.zeros_like(p.data)
 
-    def parameters(self):
-        return self.w + [self.b]
 
-    def __repr__(self):
-        return f"{'ReLU' if self.nonlin else 'Linear'}Neuron({len(self.w)})"
+class Linear(Module):
+    def __init__(
+        self,
+        n_in: int,
+        n_out: int,
+        activation: Literal["relu"] | None = None,
+    ) -> None:
+        # Kaiming init for ReLU activation
+        self.w = Tensor(np.random.randn(n_in, n_out) * np.sqrt(2.0 / n_in))
+        self.b = Tensor(np.zeros(n_out))
+        self.activation = activation
 
-class Layer(Module):
+    def __call__(self, x: Tensor) -> Tensor:
+        y = x @ self.w + self.b
+        match self.activation:
+            case "relu":
+                return y.relu()
+            case None:
+                return y
+            case _:
+                raise ValueError(f"Unknown activation: {self.activation}")
 
-    def __init__(self, nin, nout, **kwargs):
-        self.neurons = [Neuron(nin, **kwargs) for _ in range(nout)]
+    @property
+    def parameters(self) -> list[Tensor]:
+        return [self.w, self.b]
 
-    def __call__(self, x):
-        out = [n(x) for n in self.neurons]
-        return out[0] if len(out) == 1 else out
+    def __repr__(self) -> str:
+        return f"Linear({self.w.shape}, {self.b.shape})"
 
-    def parameters(self):
-        return [p for n in self.neurons for p in n.parameters()]
-
-    def __repr__(self):
-        return f"Layer of [{', '.join(str(n) for n in self.neurons)}]"
 
 class MLP(Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: list[int],
+        out_dim: int,
+        activation: Literal["relu"] | None = "relu",
+    ) -> None:
 
-    def __init__(self, nin, nouts):
-        sz = [nin] + nouts
-        self.layers = [Layer(sz[i], sz[i+1], nonlin=i!=len(nouts)-1) for i in range(len(nouts))]
+        if len(hidden_dims) < 1:
+            raise ValueError("hidden_dims must be a non-empty list of integers")
 
-    def __call__(self, x):
+        self.layers: list[Linear] = [
+            Linear(n_in, n_out, activation=activation) for n_in, n_out in pairwise([input_dim, *hidden_dims])
+        ]
+        self.layers.append(Linear(hidden_dims[-1], out_dim, activation=None))
+
+    def __call__(self, x: Tensor) -> Tensor:
         for layer in self.layers:
             x = layer(x)
         return x
 
-    def parameters(self):
-        return [p for layer in self.layers for p in layer.parameters()]
+    @property
+    def parameters(self) -> list[Tensor]:
+        return [p for layer in self.layers for p in layer.parameters]
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"MLP of [{', '.join(str(layer) for layer in self.layers)}]"
