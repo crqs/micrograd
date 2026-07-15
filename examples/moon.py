@@ -5,12 +5,14 @@ import numpy as np
 from sklearn.datasets import make_moons
 from sklearn.model_selection import train_test_split
 
-from examples.train import fit_with_sgd
+from examples.train import fit
 from micrograd import Tensor
+from micrograd.loss import binary_cross_entropy_with_logits
 from micrograd.nn import MLP
+from micrograd.optim import SGD, Adam
 
-np.random.seed(42)
-random.seed(42)
+# np.random.seed(42)
+# random.seed(42)
 
 
 def plot_results(
@@ -32,7 +34,8 @@ def plot_results(
     y_min, y_max = X[:, 1].min() - 0.5, X[:, 1].max() + 0.5
     xx, yy = np.meshgrid(np.linspace(x_min, x_max, 200), np.linspace(y_min, y_max, 200))
     grid = np.c_[xx.ravel(), yy.ravel()]
-    logits = model(Tensor(grid))
+    with model.eval():
+        logits = model(Tensor(grid))
     probs = 1 / (1 + np.exp(-logits.data))
     probs = probs.reshape(xx.shape)
 
@@ -76,19 +79,19 @@ if __name__ == "__main__":
     X_val = np.array(X_val)
     y_val = np.array(y_val).reshape(X_val.shape[0], 1)
 
-    model = MLP(2, [32, 32], 1)
-    # print(model)
-    print(f"Number of parameters: {model.nb_parameters}")
+    model = MLP(2, [32, 32], 1, dropout=0.1)
+    print(model)
 
-    results = fit_with_sgd(
+    results = fit(
         model=model,
-        nb_epochs=2_000,
-        batch_size=64,
+        optimizer=Adam(parameters=model.parameters, lr=1e-3),
+        criterion=binary_cross_entropy_with_logits,
+        nb_epochs=200,
+        batch_size=32,
         X_train=X_train,
         y_train=y_train,
         X_val=X_val,
         y_val=y_val,
-        lr=1e-2,
     )
 
     plot_results(

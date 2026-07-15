@@ -27,6 +27,7 @@ class Tensor:
         self.children = set(children)
         self.op = op  # the op that produced this node, for graphviz / debugging / etc
 
+    @property
     def shape(self) -> tuple[int, ...]:
         return self.data.shape
 

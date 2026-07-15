@@ -1,4 +1,6 @@
 from abc import ABC, abstractmethod
+from collections.abc import Generator
+from contextlib import contextmanager
 from itertools import pairwise
 from typing import Literal
 
@@ -8,9 +10,14 @@ from .tensor import Tensor
 
 
 class Module(ABC):
+    training: bool
+
     @property
     @abstractmethod
     def parameters(self) -> list[Tensor]: ...
+
+    @abstractmethod
+    def __call__(self, x: Tensor) -> Tensor: ...
 
     @property
     def nb_parameters(self) -> int:
@@ -32,6 +39,7 @@ class Linear(Module):
         self.w = Tensor(np.random.randn(n_in, n_out) * np.sqrt(2.0 / n_in))
         self.b = Tensor(np.zeros(n_out))
         self.activation = activation
+        self.training = True
 
     def __call__(self, x: Tensor) -> Tensor:
         y = x @ self.w + self.b
@@ -48,7 +56,47 @@ class Linear(Module):
         return [self.w, self.b]
 
     def __repr__(self) -> str:
-        return f"Linear({self.w.shape}, {self.b.shape})"
+        return f"Linear({self.w.shape}, {self.b.shape}, activation={self.activation})"
+
+
+class Dropout(Module):
+    """
+    Dropout module implemented from https://jmlr.org/papers/volume15/srivastava14a/srivastava14a.pdf
+    """
+
+    def __init__(self, dropout: float) -> None:
+        self.dropout = dropout
+        self.training = True
+
+    def __call__(self, x: Tensor) -> Tensor:
+        if self.training:
+            p = np.random.rand(*x.shape) > self.dropout
+
+            # mask data + apply inverted dropout scaling
+            out = Tensor(x.data * p / (1 - self.dropout), children=(x,))
+
+            def _backward():
+                x.grad += out.grad * p / (1 - self.dropout)
+
+            out.set_backward(_backward)
+            return out
+
+        return x
+
+    @property
+    def parameters(self) -> list[Tensor]:
+        return []
+
+    def __repr__(self) -> str:
+        return f"Dropout({self.dropout})"
+
+
+class LayerNorm(Module):
+    """
+    LayerNorm implemented from https://arxiv.org/pdf/1607.06450
+    """
+
+    # TODO:
 
 
 class MLP(Module):
@@ -57,16 +105,38 @@ class MLP(Module):
         input_dim: int,
         hidden_dims: list[int],
         out_dim: int,
+        dropout: float,
         activation: Literal["relu"] | None = "relu",
     ) -> None:
 
         if len(hidden_dims) < 1:
             raise ValueError("hidden_dims must be a non-empty list of integers")
 
-        self.layers: list[Linear] = [
-            Linear(n_in, n_out, activation=activation) for n_in, n_out in pairwise([input_dim, *hidden_dims])
-        ]
+        self.layers: list[Module] = []
+
+        self.layers.append(Linear(input_dim, hidden_dims[0], activation=activation))
+
+        for n_in, n_out in pairwise(hidden_dims):
+            if dropout > 0.0:
+                self.layers.append(Dropout(dropout=dropout))
+
+            self.layers.append(Linear(n_in, n_out, activation=activation))
+
+        if dropout > 0.0:
+            self.layers.append(Dropout(dropout=dropout))
         self.layers.append(Linear(hidden_dims[-1], out_dim, activation=None))
+
+        self.training = True
+
+    @contextmanager
+    def eval(self) -> Generator[None]:
+        self.training = False
+        for layer in self.layers:
+            layer.training = False
+        yield
+        self.training = True
+        for layer in self.layers:
+            layer.training = True
 
     def __call__(self, x: Tensor) -> Tensor:
         for layer in self.layers:
@@ -78,4 +148,4 @@ class MLP(Module):
         return [p for layer in self.layers for p in layer.parameters]
 
     def __repr__(self) -> str:
-        return f"MLP of [{', '.join(str(layer) for layer in self.layers)}]"
+        return f"MLP ({self.nb_parameters} parameters)\n    {'\n    '.join(str(layer) for layer in self.layers)}]"
