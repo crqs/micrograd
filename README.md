@@ -1,7 +1,13 @@
-
 # micrograd
 
-A tiny Autograd engine forked from https://github.com/karpathy/micrograd with some additions.
+This project is a personal learning project which purpose is to reimplement core deep learning principles in
+numpy and build intuition on those. It is heavily inspired and built on top of Andrej Karpathy's `micrograd` project.
+
+It currently implements a working MLP trainable on classification tasks using the Adam optimizer.
+
+The `visualisation` module is a vibe-coded mess, the code is horrendous but the result looks nice :p
+
+Forked from https://github.com/karpathy/micrograd.
 
 ### Installation
 
@@ -9,59 +15,30 @@ A tiny Autograd engine forked from https://github.com/karpathy/micrograd with so
 uv sync --all-extras
 ```
 
-### Example usage
+### Examples
 
-Below is a slightly contrived example showing a number of possible supported operations:
+You can run toy classification problems (scikit learn moons and circles) by running:
+```
+python examples/toy_classification.py  --dataset moons
 
-```python
-from micrograd.engine import Value
-
-a = Value(-4.0)
-b = Value(2.0)
-c = a + b
-d = a * b + b**3
-c += c + 1
-c += 1 + c + (-a)
-d += d * 2 + (b + a).relu()
-d += 3 * d + (b - a).relu()
-e = c - d
-f = e**2
-g = f / 2.0
-g += 10.0 / f
-print(f'{g.data:.4f}') # prints 24.7041, the outcome of this forward pass
-g.backward()
-print(f'{a.grad:.4f}') # prints 138.8338, i.e. the numerical value of dg/da
-print(f'{b.grad:.4f}') # prints 645.5773, i.e. the numerical value of dg/db
+```
+![Moons](assets/results_moons.png)
+and 
 ```
 
-### Training a neural net
-
-The notebook `demo.ipynb` provides a full demo of training an 2-layer neural network (MLP) binary classifier. This is achieved by initializing a neural net from `micrograd.nn` module, implementing a simple svm "max-margin" binary classification loss and using SGD for optimization. As shown in the notebook, using a 2-layer neural net with two 16-node hidden layers we achieve the following decision boundary on the moon dataset:
-
-![2d neuron](moon_mlp.png)
-
-### Tracing / visualization
-
-For added convenience, the notebook `trace_graph.ipynb` produces graphviz visualizations. E.g. this one below is of a simple 2D neuron, arrived at by calling `draw_dot` on the code below, and it shows both the data (left number in each node) and the gradient (right number in each node).
-
-```python
-from micrograd import nn
-n = nn.Neuron(2)
-x = [Value(1.0), Value(-2.0)]
-y = n(x)
-dot = draw_dot(y)
+python examples/toy_classification.py  --dataset circles
 ```
 
-![2d neuron](gout.svg)
 
-### Running tests
+![Circles](assets/results_circles.png)
 
-To run the unit tests you will have to install [PyTorch](https://pytorch.org/), which the tests use as a reference for verifying the correctness of the calculated gradients. Then simply:
+### Visualisation
+The visualisation module allows to see _everything_ happening in the network during training, including
+forward and backward passes.
 
-```bash
-python -m pytest
-```
+![Visualisation](assets/visualisation.png)
 
 ### License
+
 
 MIT

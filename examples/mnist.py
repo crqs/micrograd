@@ -42,7 +42,6 @@ def plot_results(
     fig2.suptitle("Sample predictions")
 
     plt.tight_layout()
-    plt.savefig("results_mnist.png")
     plt.show()
 
 

@@ -70,7 +70,6 @@ def plot_results(
     ax2.legend()
 
     plt.tight_layout()
-    plt.savefig(f"results_{title}.png")
     plt.show()
 
 
