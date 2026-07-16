@@ -10,6 +10,8 @@ from examples.train import fit
 from micrograd import Tensor
 from micrograd.loss import softmax_cross_entropy_with_logits
 from micrograd.nn import MLP
+from micrograd.operations import softmax
+from micrograd.optim import Adam
 
 np.random.seed(42)
 random.seed(42)
@@ -67,29 +69,34 @@ if __name__ == "__main__":
 
     print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
 
-    model = MLP(784, [256, 128], 10)
+    class Classifier(MLP):
+        def predict(self, x: Tensor) -> np.ndarray:
+            """
+            The MLP outputs raw logits. We need to transform them in probas through
+            softmax and take the most probable class.
+            """
+            return np.argmax(softmax(super().__call__(x)).data, axis=-1)
+
+    model = Classifier(784, [256, 128], 10, dropout=0.2)
     print(f"Number of parameters: {model.nb_parameters}")
 
     results = fit(
         model=model,
         criterion=softmax_cross_entropy_with_logits,
+        optimizer=Adam(parameters=model.parameters, lr=1e-3),
         nb_epochs=20,
-        batch_size=64,
+        batch_size=128,
         X_train=X_train,
         y_train=y_train,
         X_val=X_val,
         y_val=y_val,
-        lr=1e-2,
     )
 
     # sample predictions on 10 exemples from test set
-    logits = model(Tensor(X_test[:10]))
-    preds = np.argmax(logits.data, axis=-1)
-
     plot_results(
         losses=results.loss,
         val_losses=results.val_loss,
         sample_images=X_test[:10],
-        sample_preds=preds,
+        sample_preds=model.predict(Tensor(X_test[:10])),
         sample_labels=y_test[:10].ravel(),
     )
