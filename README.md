@@ -5,6 +5,8 @@ learning principles in numpy and build intuition about them. It is heavily inspi
 by and built on top of Andrej Karpathy's `micrograd` project. It currently implements
 a working MLP trainable on classification tasks using the Adam optimizer.
 
+![Visualisation](assets/visualisation.gif)
+
 Forked from https://github.com/karpathy/micrograd.
 
 ### Installation
@@ -17,14 +19,16 @@ uv sync --all-extras
 
 You can run toy classification problems (scikit-learn moons and circles) by running:
 ```
-python examples/toy_classification.py  --dataset moons
+python examples/toy_classification.py --dataset moons
 
 ```
 ![Moons](assets/results_moons.png)
+
 and 
+
 ```
 
-python examples/toy_classification.py  --dataset circles
+python examples/toy_classification.py --dataset circles
 ```
 
 ![Circles](assets/results_circles.png)
@@ -42,8 +46,6 @@ You can:
 
 > [!CAUTION]
 > The visualisation module is a vibe-coded mess, don't expect it to be polished.
-
-![Visualisation](assets/visualisation.gif)
 
 ### License
 
