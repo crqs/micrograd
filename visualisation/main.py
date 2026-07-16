@@ -58,7 +58,7 @@ ROW_GAP = 36
 MIN_SCALE, MAX_SCALE = 0.12, 6.0
 
 # playback: auto-play advances ops at SPEED ops/second; turbo skips animation
-SPEED_MIN, SPEED_MAX, SPEED_DEFAULT = 1.0, 240.0, 6.0
+SPEED_MIN, SPEED_MAX, SPEED_DEFAULT = 1.0, 240.0, 2.0
 TURBO_BATCHES_PER_FRAME = 6  # whole batches trained per frame in fast-forward
 BOUNDARY_RES = 72  # decision-boundary grid resolution
 
