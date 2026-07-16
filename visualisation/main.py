@@ -40,7 +40,7 @@ import visualisation.core as core
 ARCH = (2, [8, 6], 1)
 BATCH = 8
 SEED = 42
-DROPOUT = 0.0  # 0.0 -> clean matmul/add/relu graph (bump to add Dropout nodes)
+DROPOUT = 0.1  # 0.0 -> clean matmul/add/relu graph (bump to add Dropout nodes)
 LR = 0.02  # Adam learning rate (train.fit uses Adam; a touch higher so it visibly learns)
 N_SAMPLES = 500  # dataset size (like toy_classification); train set trimmed to a whole # of batches
 DATASET = "moons"  # default; overridden by --dataset
