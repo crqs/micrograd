@@ -78,3 +78,8 @@ combine-as-imports = true
 force-wrap-aliases = true
 split-on-trailing-comma = false
 forced-separate = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101", # asserts allowed in tests
+]

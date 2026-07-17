@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -6,11 +8,12 @@ from typing import Literal
 
 import numpy as np
 
+from .operations import softmax
 from .tensor import Tensor
 
 
 class Module(ABC):
-    training: bool
+    training: bool = True
 
     @property
     @abstractmethod
@@ -29,17 +32,12 @@ class Module(ABC):
 
 
 class Linear(Module):
-    def __init__(
-        self,
-        n_in: int,
-        n_out: int,
-        activation: Literal["relu"] | None = None,
-    ) -> None:
+    def __init__(self, n_in: int, n_out: int, activation: Literal["relu"] | None) -> None:
+        super().__init__()
         # Kaiming init for ReLU activation
         self.w = Tensor(np.random.randn(n_in, n_out) * np.sqrt(2.0 / n_in))
         self.b = Tensor(np.zeros(n_out))
         self.activation = activation
-        self.training = True
 
     def __call__(self, x: Tensor) -> Tensor:
         y = x @ self.w + self.b
@@ -59,21 +57,42 @@ class Linear(Module):
         return f"Linear({self.w.shape}, {self.b.shape}, activation={self.activation})"
 
 
+class Attention(Module):
+    def __init__(self, n_in: int, d_k: int, d_v: int) -> None:
+        super().__init__()
+        self.d_k = d_k
+        self.w_k = Tensor(np.random.randn(n_in, d_k))
+        self.w_q = Tensor(np.random.randn(n_in, d_k))
+        self.w_v = Tensor(np.random.randn(n_in, d_v))
+
+    def __call__(self, x: Tensor) -> Tensor:
+        # x (seq_len, n_in)
+        Q = x @ self.w_q  # (seq_len, d_k)
+        K = x @ self.w_k  # (seq_len, d_k)
+        V = x @ self.w_v  # (seq_len, d_v)
+
+        return softmax(Q @ K.T / np.sqrt(self.d_k)) @ V  # (seq_len, d_v)
+
+    @property
+    def parameters(self) -> list[Tensor]:
+        return [self.w_k, self.w_q, self.w_v]
+
+
 class Dropout(Module):
     """
     Dropout module implemented from https://jmlr.org/papers/volume15/srivastava14a/srivastava14a.pdf
     """
 
     def __init__(self, dropout: float) -> None:
+        super().__init__()
         self.dropout = dropout
-        self.training = True
 
     def __call__(self, x: Tensor) -> Tensor:
         if self.training:
             p = np.random.rand(*x.shape) > self.dropout
 
             # mask data + apply inverted dropout scaling
-            out = Tensor(x.data * p / (1 - self.dropout), children=(x,))
+            out = Tensor(x.data * p / (1 - self.dropout), children={x})
 
             def _backward():
                 x.grad += out.grad * p / (1 - self.dropout)
@@ -108,25 +127,22 @@ class MLP(Module):
         dropout: float,
         activation: Literal["relu"] | None = "relu",
     ) -> None:
+        super().__init__()
 
         if len(hidden_dims) < 1:
             raise ValueError("hidden_dims must be a non-empty list of integers")
 
         self.layers: list[Module] = []
-
         self.layers.append(Linear(input_dim, hidden_dims[0], activation=activation))
 
         for n_in, n_out in pairwise(hidden_dims):
             if dropout > 0.0:
                 self.layers.append(Dropout(dropout=dropout))
-
             self.layers.append(Linear(n_in, n_out, activation=activation))
 
         if dropout > 0.0:
             self.layers.append(Dropout(dropout=dropout))
         self.layers.append(Linear(hidden_dims[-1], out_dim, activation=None))
-
-        self.training = True
 
     @contextmanager
     def eval(self) -> Generator[None]:

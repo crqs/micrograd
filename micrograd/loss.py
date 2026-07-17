@@ -8,7 +8,7 @@ def binary_cross_entropy_with_logits(x: Tensor, y: np.ndarray) -> Tensor:
     z = x.data
     # stable form: max(z,0) - z*y + log(1 + e^{-|z|})
     loss = np.mean(np.maximum(z, 0) - z * y + np.log1p(np.exp(-np.abs(z))))
-    out = Tensor(loss, (x,))
+    out = Tensor(loss, children={x})
 
     def _backward():
         p = 1 / (1 + np.exp(-z))  # sigmoid, uniquement pour le gradient
@@ -24,7 +24,7 @@ def softmax_cross_entropy_with_logits(x: Tensor, y: np.ndarray) -> Tensor:
     e = np.exp(x.data - np.max(x.data, axis=-1, keepdims=True))
     p = e / np.sum(e, axis=-1, keepdims=True)
 
-    out = Tensor(-np.mean(np.log(p[np.arange(N), y.ravel()])), (x,))
+    out = Tensor(-np.mean(np.log(p[np.arange(N), y.ravel()])), children={x})
 
     def _backward():
         grad = p.copy()

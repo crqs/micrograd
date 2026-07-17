@@ -4,7 +4,7 @@ from .tensor import Tensor
 
 
 def log(x: Tensor) -> Tensor:
-    out = Tensor(np.log(x.data), (x,))
+    out = Tensor(np.log(x.data), children={x})
 
     def _backward():
         x.grad += out.grad * x.data ** (-1)

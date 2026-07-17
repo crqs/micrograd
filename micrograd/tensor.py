@@ -13,23 +13,34 @@ class Tensor:
     backward method to compute gradients through the computational graph.
     """
 
-    def __init__(
-        self,
-        data: float | list[float] | np.ndarray,
-        children: tuple[Tensor, ...] = (),
-        op: str = "",
-    ) -> None:
+    data: np.ndarray
+    grad: np.ndarray
+
+    # internal variables used for autograd graph construction
+    children: set[Tensor]
+    _backward: Callable[[], None]
+
+    def __init__(self, data: float | list[float] | np.ndarray, *, children: set[Tensor] | None = None) -> None:
         self.data = np.array(data)
         self.grad = np.zeros_like(data, dtype=float)
 
-        # internal variables used for autograd graph construction
+        self.children = children or set()
         self._backward = lambda: None
-        self.children = set(children)
-        self.op = op  # the op that produced this node, for graphviz / debugging / etc
 
     @property
     def shape(self) -> tuple[int, ...]:
         return self.data.shape
+
+    @property
+    def T(self) -> Tensor:
+        out = Tensor(self.data.T, children={self})
+
+        def _backward():
+            self.grad += out.grad.T
+
+        out.set_backward(_backward)
+
+        return out
 
     def set_backward(self, backward: Callable[[], None]) -> None:
         self._backward = backward
@@ -49,11 +60,21 @@ class Tensor:
         if isinstance(other, (int, float)):
             other = Tensor(np.array(other))
 
-        out = Tensor(self.data + other.data, (self, other), "+")
+        out = Tensor(self.data + other.data, children={self, other})
 
         def _backward():
             self.grad += self._unbroadcast(out.grad, self.grad.shape)
             other.grad += self._unbroadcast(out.grad, other.grad.shape)
+
+        out.set_backward(_backward)
+
+        return out
+
+    def sum(self) -> Tensor:
+        out = Tensor(self.data.sum(), children={self})
+
+        def _backward():
+            self.grad += np.ones_like(self.data) * out.grad
 
         out.set_backward(_backward)
 
@@ -64,7 +85,7 @@ class Tensor:
         if isinstance(other, (int, float)):
             other = Tensor(np.array(other))
 
-        out = Tensor(np.multiply(self.data, other.data), (self, other), "*")
+        out = Tensor(np.multiply(self.data, other.data), children={self, other})
 
         def _backward():
             self.grad += other.data * self._unbroadcast(out.grad, self.grad.shape)
@@ -75,7 +96,7 @@ class Tensor:
         return out
 
     def __matmul__(self, other: Tensor) -> Tensor:
-        out = Tensor(np.matmul(self.data, other.data), (self, other), "@")
+        out = Tensor(np.matmul(self.data, other.data), children={self, other})
 
         def _backward():
             self.grad += np.matmul(out.grad, other.data.T)
@@ -87,17 +108,17 @@ class Tensor:
 
     def __pow__(self, n: int | float) -> Tensor:
 
-        out = Tensor(np.pow(self.data, n), (self,), f"**{n}")
+        out = Tensor(np.pow(self.data, n), children={self})
 
         def _backward():
-            self.grad += n * out.grad * np.power(self.data, n - 1)
+            self.grad += n * out.grad * np.pow(self.data, n - 1)
 
         out.set_backward(_backward)
 
         return out
 
     def relu(self) -> Tensor:
-        out = Tensor(np.maximum(self.data, 0), (self,), "ReLU")
+        out = Tensor(np.maximum(self.data, 0), children={self})
 
         def _backward():
             self.grad += np.where(out.data > 0, out.grad, 0)
@@ -122,9 +143,9 @@ class Tensor:
         build_topo(self)
 
         # go one variable at a time and apply the chain rule to get its gradient
-        self.grad = np.array(1.0)
-        for v in reversed(topo):
-            v._backward()
+        self.grad = np.ones_like(self.data)
+        for t in reversed(topo):
+            t._backward()
 
     def __neg__(self):
         return self * Tensor(-1)
@@ -148,4 +169,4 @@ class Tensor:
         return other * self**-1
 
     def __repr__(self):
-        return f"Value(data={self.data}, grad={self.grad})"
+        return f"Tensor(data={self.data}, grad={self.grad})"
