@@ -31,5 +31,18 @@ def softmax_cross_entropy_with_logits(x: Tensor, y: np.ndarray) -> Tensor:
         grad[np.arange(N), y.ravel()] -= 1
         x.grad += grad / N
 
-    out._backward = _backward
+    out.set_backward(_backward)
+    return out
+
+
+def mse(y: Tensor, y_true: np.ndarray) -> Tensor:
+    N = y.data.size
+    diff = y.data - y_true
+
+    out = Tensor(np.mean(np.pow(diff, 2)), children={y})
+
+    def _backward():
+        y.grad += (2 / N) * (diff) * out.grad
+
+    out.set_backward(_backward)
     return out

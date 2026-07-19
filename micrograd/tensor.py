@@ -42,6 +42,25 @@ class Tensor:
 
         return out
 
+    def squeeze(self, axis: int) -> Tensor:
+        out = Tensor(self.data.squeeze(axis), children={self})
+
+        def _backward():
+            self.grad += np.expand_dims(out.grad, axis)
+
+        out.set_backward(_backward)
+        return out
+
+    def swapaxes(self, axis1: int, axis2: int) -> Tensor:
+        out = Tensor(self.data.swapaxes(axis1, axis2), children={self})
+
+        def _backward():
+            self.grad += out.grad.swapaxes(axis1, axis2)
+
+        out.set_backward(_backward)
+
+        return out
+
     def set_backward(self, backward: Callable[[], None]) -> None:
         self._backward = backward
 
@@ -95,15 +114,25 @@ class Tensor:
 
         return out
 
+    # def __matmul__(self, other: Tensor) -> Tensor:
+    #     out = Tensor(np.matmul(self.data, other.data), children={self, other})
+    #
+    #     def _backward():
+    #         self.grad += np.matmul(out.grad, other.data.swapaxes(-1, -2))
+    #         other.grad += np.matmul(self.data.swapaxes(-1, -2), out.grad)
+    #
+    #     out.set_backward(_backward)
+    #
+    #     return out
+
     def __matmul__(self, other: Tensor) -> Tensor:
         out = Tensor(np.matmul(self.data, other.data), children={self, other})
 
         def _backward():
-            self.grad += np.matmul(out.grad, other.data.T)
-            other.grad += np.matmul(self.data.T, out.grad)
+            self.grad += self._unbroadcast(np.matmul(out.grad, other.data.swapaxes(-1, -2)), self.grad.shape)
+            other.grad += self._unbroadcast(np.matmul(self.data.swapaxes(-1, -2), out.grad), other.grad.shape)
 
         out.set_backward(_backward)
-
         return out
 
     def __pow__(self, n: int | float) -> Tensor:

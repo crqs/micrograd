@@ -61,21 +61,67 @@ class Attention(Module):
     def __init__(self, n_in: int, d_k: int, d_v: int) -> None:
         super().__init__()
         self.d_k = d_k
-        self.w_k = Tensor(np.random.randn(n_in, d_k))
-        self.w_q = Tensor(np.random.randn(n_in, d_k))
-        self.w_v = Tensor(np.random.randn(n_in, d_v))
+        self.d_v = d_v
+        # Xavier init
+        self.w_q = Tensor(np.random.randn(n_in, d_k) * np.sqrt(2.0 / (n_in + d_k)))
+        self.w_k = Tensor(np.random.randn(n_in, d_k) * np.sqrt(2.0 / (n_in + d_k)))
+        self.w_v = Tensor(np.random.randn(n_in, d_v) * np.sqrt(2.0 / (n_in + d_v)))
 
-    def __call__(self, x: Tensor) -> Tensor:
-        # x (seq_len, n_in)
-        Q = x @ self.w_q  # (seq_len, d_k)
-        K = x @ self.w_k  # (seq_len, d_k)
-        V = x @ self.w_v  # (seq_len, d_v)
+    def __call__(
+        self,
+        x: Tensor,
+        mask: np.ndarray | None = None,
+    ) -> Tensor:
+        # x (batch, seq_len, n_in)
+        Q = x @ self.w_q  # (batch, seq_len, d_k)
+        K = x @ self.w_k  # (batch, seq_len, d_k)
+        V = x @ self.w_v  # (batch, seq_len, d_v)
 
-        return softmax(Q @ K.T / np.sqrt(self.d_k)) @ V  # (seq_len, d_v)
+        if mask is not None:
+            b, s = mask.shape
+            QKt = Q @ K.swapaxes(-1, -2) + Tensor((1 - mask.reshape(b, 1, s)) * -1e9)
+            # QKt = Q @ K.swapaxes(-1, -2) + Tensor((1 - mask[:, None, :]) * -1e9)
+        else:
+            QKt = Q @ K.swapaxes(-1, -2)
+
+        return softmax(QKt / np.sqrt(self.d_k), axis=-1) @ V  # (batch, seq_len, d_v)
 
     @property
     def parameters(self) -> list[Tensor]:
         return [self.w_k, self.w_q, self.w_v]
+
+    def __repr__(self) -> str:
+        return f"Attention ({self.nb_parameters} parameters, {self.d_k=}, {self.d_v=})"
+
+
+class MeanPool(Module):
+    def __call__(self, x: Tensor, mask: np.ndarray | None = None) -> Tensor:
+
+        if mask is not None:
+            N = mask.sum(axis=1)[:, None]  # number of valid values
+            pooled = (x.data * mask[:, :, None]).sum(axis=-2) / N
+        else:
+            N = x.shape[-2]
+            pooled = x.data.sum(axis=-2) / N
+
+        out = Tensor(pooled, children={x})
+
+        def _backward():
+            # backward, the gradient needs to be broadcasted among the pooled axis
+            if mask is not None:
+                x.grad += np.ones_like(x.data) * (out.grad / N)[:, None, :] * mask[:, :, None]
+            else:
+                x.grad += np.ones_like(x.data) * (out.grad / N)[:, None, :]
+
+        out.set_backward(_backward)
+        return out
+
+    @property
+    def parameters(self) -> list[Tensor]:
+        return []
+
+    def __repr__(self) -> str:
+        return "MeanPool"
 
 
 class Dropout(Module):
@@ -116,6 +162,15 @@ class LayerNorm(Module):
     """
 
     # TODO:
+
+
+class LogitsBinaryMask(Module):
+    def __call__(self, x: Tensor, mask: np.ndarray) -> Tensor:  # type: ignore
+        return x + Tensor(-(1 - mask[:, :, None]) * 1e9)
+
+    @property
+    def parameters(self) -> list[Tensor]:
+        return []
 
 
 class MLP(Module):

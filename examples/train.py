@@ -16,7 +16,7 @@ class Results:
 
 
 def fit(
-    model: nn.MLP,
+    model: nn.Module,  # FIXME: more generic type
     optimizer: Optimizer,
     criterion: Callable[[Tensor, np.ndarray], Tensor],
     nb_epochs: int,
