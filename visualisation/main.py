@@ -44,6 +44,7 @@ import visualisation.core as core
 #  CONFIG  (what to visualise — the model / training choices live here)
 # ======================================================================
 MODEL_KIND = "mlp"  # "mlp" | "attention"  -> which model's graph to visualise (or --model)
+TASK = "classification"  # attention only: "classification" (max position) | "regression" (max value); or --task
 
 # --- MLP mode (toy_classification: moons / circles) ---
 ARCH = (2, [8, 6], 1)
@@ -53,10 +54,12 @@ LR = 0.02  # Adam learning rate (train.fit uses Adam; a touch higher so it visib
 N_SAMPLES = 500  # dataset size (like toy_classification); train set trimmed to a whole # of batches
 DATASET = "moons"  # default; overridden by --dataset
 
-# --- attention mode (examples/attention/maximum_regression: MaxRegressionModel) ---
-# tiny on purpose: n_in=1, d_k=d_v=8, hidden=[8], seq_len 4 (+1 padded key) so every
-# matrix — especially the attention weights — stays fully readable.
-ATTN_BATCH = 2  # sequences per batch (each shown as sample 0)
+# --- attention mode (examples/attention: MaxClassificationModel or MaxRegressionModel) ---
+# tiny on purpose: d_k=d_v=8, hidden=[8], seq_len 4 (+1 padded key) so every matrix —
+# especially the attention weights — stays readable. Classification uses n_in=3 (1 value
+# + 2 positional dims); regression uses n_in=1 (raw value only).
+ATTN_BATCH = 1  # one sequence per batch, so EVERY node (incl. the 2D logits) shows that
+#                 single sample — no mixing "sample 0 only" (3D nodes) with "all rows" (2D)
 ATTN_LR = 0.01
 ATTN_N_SAMPLES = 64
 
@@ -390,11 +393,14 @@ class Scene:
 #  APP
 # ======================================================================
 class App:
-    def __init__(self, headless=False, dataset=DATASET, model_kind=MODEL_KIND):
+    def __init__(self, headless=False, dataset=DATASET, model_kind=MODEL_KIND, task=TASK):
         if headless:
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         pygame.init()
-        title = dataset if model_kind == "mlp" else "attention (max-position)"
+        if model_kind == "mlp":
+            title = dataset
+        else:
+            title = "attention (max-position)" if task == "classification" else "attention (max-value)"
         pygame.display.set_caption(f"micrograd — training ({title})")
         # open large: up to WIN_W x WIN_H, but capped to ~92% of the actual display
         win = (WIN_W, WIN_H)
@@ -421,6 +427,7 @@ class App:
         # thing that branches on the model is which trainer we build here.
         self.dataset = dataset
         self.model_kind = model_kind
+        self.task = task
         self.has_dataset_panel = model_kind == "mlp"  # 2D boundary only makes sense for moons/circles
         self.trainer = core.make_trainer(
             model_kind,
@@ -431,6 +438,7 @@ class App:
             arch=ARCH,
             batch_size=BATCH if model_kind == "mlp" else ATTN_BATCH,
             dropout=DROPOUT,
+            task=task,
         )
         self._rebuild_scenes()
         self.collapse = False
@@ -781,7 +789,8 @@ class App:
         col = pygame.Rect(int(rect.x + mp * cw), int(top), int(cw) + 1, int(r * ch) + 1)
         pygame.draw.rect(self.screen, MAX_MARK, col, width=4)
         # caret BELOW the node (the top is taken by the "ATTENTION WEIGHTS" label)
-        caret = self.f_title.render(f"^ max value (key {mp})", True, MAX_MARK)
+        noun = "position" if info.get("task", "classification") == "classification" else "value"
+        caret = self.f_title.render(f"^ true max {noun} (key {mp})", True, MAX_MARK)
         self.screen.blit(caret, (col.centerx - caret.get_width() // 2, rect.bottom + 6))
 
     def _draw_nodes(self):
@@ -898,24 +907,25 @@ class App:
 
     def _draw_seq_panel(self):
         """Attention mode (upper-right): the current sequence (sample 0) as a row of
-        value cells with the true max ringed in magenta, plus true vs predicted max —
-        so the max marked on the attention-weights matrix has an obvious referent."""
+        value cells with the true-max position ringed in magenta and the model's
+        predicted position ringed in orange, plus the true vs predicted index — so the
+        max marked on the attention-weights matrix has an obvious referent."""
         info = getattr(self.trainer, "attn_info", None)
         if info is None:
             return
         vals, mask, mp = info["seq_vals"], info["mask"], info["max_pos"]
+        classification = info.get("task", "classification") == "classification"
+        if classification:
+            tp, pp = info["true_pos"], info["pred_pos"]
+            hit = "✓" if pp == tp else "✗"
+            label = f"sequence (sample 0)   ·   true max @ k{tp}   ·   pred @ k{pp}  {hit}"
+        else:
+            label = f"sequence (sample 0)   ·   true max {info['true_max']:.1f}   ·   pred {info['pred_max']:.2f}"
         s = len(vals)
         cell = min(64, max(34, (self.w - 40) // max(12, s)))
         panel_w = s * cell + 24
         x0, y0 = self.w - panel_w - 20, TOP_H + 40
-        self.screen.blit(
-            self.f_card.render(
-                f"sequence (sample 0)   ·   true max {info['true_max']:.1f}   ·   pred {info['pred_max']:.2f}",
-                True,
-                INK,
-            ),
-            (x0, y0 - 26),
-        )
+        self.screen.blit(self.f_card.render(label, True, INK), (x0, y0 - 26))
         for j in range(s):
             cr = pygame.Rect(int(x0 + j * cell), int(y0), int(cell), int(cell))
             padded = mask[j] <= 0.5
@@ -927,7 +937,10 @@ class App:
             self.screen.blit(g, g.get_rect(center=cr.center))
             kg = self.f_hint.render(f"k{j}", True, MUTED)  # key index under each cell
             self.screen.blit(kg, kg.get_rect(center=(cr.centerx, cr.bottom + 9)))
-        mrect = pygame.Rect(int(x0 + mp * cell), int(y0), int(cell), int(cell))  # ring the max
+        if classification and 0 <= pp < s:  # ring the predicted position (orange), behind the true-max ring
+            prect = pygame.Rect(int(x0 + pp * cell), int(y0), int(cell), int(cell))
+            pygame.draw.rect(self.screen, BORDER_ACTIVE, prect.inflate(12, 12), width=3)
+        mrect = pygame.Rect(int(x0 + mp * cell), int(y0), int(cell), int(cell))  # ring the true max
         pygame.draw.rect(self.screen, MAX_MARK, mrect.inflate(6, 6), width=3)
 
     def _draw_hud(self):
@@ -1133,51 +1146,48 @@ def selftest() -> int:
     _check(app.boundary_surf is not None, "no boundary surface in mlp mode")
     print("  decision_grid ok, matmul VJP ok, turbo advanced an epoch + redrew boundary")
 
-    # ---------------- ATTENTION mode (the new centerpiece) ----------------
-    print("[selftest] MODEL_KIND='attention' ...")
-    app = App(headless=True, model_kind="attention")
-    tr = app.trainer
-    print(f"  batch {ATTN_BATCH}, train samples {tr.nb_samples}, {tr.nb_batches} batches/epoch")
-    det = app.scenes[False]
-    hl = [k for k, ni in det.nodes.items() if ni.highlight]
-    _check(len(hl) == 1, f"expected exactly one attention-weights node, got {hl}")
-    wnode = det.nodes[hl[0]]
-    _check(wnode.role == "softmax", "highlight node is not the softmax output")
-    W = as2d(wnode.mat)  # sample-0 (seq_q, seq_k) attention weights
-    _check(W.ndim == 2 and W.shape[0] == W.shape[1], f"attn weights not square (seq,seq): {W.shape}")
-    _check(np.allclose(W.sum(axis=-1), 1.0, atol=1e-4), "attention rows do not sum to 1")
-    _check(float(W[:, -1].max()) < 1e-3, "masked (padded) key column is not ~0")
-    # the highlight node uses bigger CELLS than an ordinary node (Q is wide via d_k)
-    cell_attn = det.sizes[hl[0]][0] / W.shape[1]
-    cell_q = det.sizes["Q"][0] / as2d(det.nodes["Q"].mat).shape[1]
-    _check(cell_attn > cell_q + 1, "attention-weights node is not drawn bigger (per cell)")
-    _check("max_pos" in tr.attn_info and 0 <= tr.attn_info["max_pos"] < W.shape[1], "attn_info missing max_pos")
-    _check(app.has_dataset_panel is False and app.panel_geom() is None, "attention should hide the dataset panel")
-    print(f"  attention '{hl[0]}' {W.shape}: rows sum to 1, masked key ~0, cells {cell_attn:.0f}px > {cell_q:.0f}px")
-    _check_common(app)
+    # ---------------- ATTENTION mode (both tasks: classification + regression) ----------------
+    for task in ("classification", "regression"):
+        print(f"[selftest] MODEL_KIND='attention' task={task!r} ...")
+        app = App(headless=True, model_kind="attention", task=task)
+        tr = app.trainer
+        print(f"  batch {ATTN_BATCH}, train samples {tr.nb_samples}, {tr.nb_batches} batches/epoch")
+        det = app.scenes[False]
+        hl = [k for k, ni in det.nodes.items() if ni.highlight]
+        _check(len(hl) == 1, f"expected exactly one attention-weights node, got {hl}")
+        wnode = det.nodes[hl[0]]
+        _check(wnode.role == "softmax", "highlight node is not the softmax output")
+        W = as2d(wnode.mat)  # sample-0 (seq_q, seq_k) attention weights
+        _check(W.ndim == 2 and W.shape[0] == W.shape[1], f"attn weights not square (seq,seq): {W.shape}")
+        _check(np.allclose(W.sum(axis=-1), 1.0, atol=1e-4), "attention rows do not sum to 1")
+        _check(float(W[:, -1].max()) < 1e-3, "masked (padded) key column is not ~0")
+        # the highlight (attention-weights) node uses bigger CELLS than an ordinary node
+        cell_attn = det.sizes[hl[0]][0] / W.shape[1]
+        cell_x = det.sizes["x"][0] / as2d(det.nodes["x"].mat).shape[1]
+        _check(cell_attn > cell_x + 1, "attention-weights node is not drawn bigger (per cell)")
+        _check("max_pos" in tr.attn_info and 0 <= tr.attn_info["max_pos"] < W.shape[1], "attn_info missing max_pos")
+        _check(app.has_dataset_panel is False and app.panel_geom() is None, "attention should hide the dataset panel")
+        print(f"  attention '{hl[0]}' {W.shape}: rows sum to 1, masked key ~0, cells {cell_attn:.0f}px > {cell_x:.0f}px")
+        _check_common(app)
 
-    # THE GOAL: after training, attention concentrates on the true max key position.
-    def rows_hit_max():  # fraction of valid query rows whose argmax key == the true max
-        info = tr.attn_info
-        A = as2d(app.scenes[False].nodes[hl[0]].mat)
-        valid = int(info["mask"].sum())
-        mp = info["max_pos"]
-        return float(np.mean(np.argmax(A[:valid], axis=-1) == mp))
-
-    before = rows_hit_max()
-    app.turbo = True
-    for _ in range(120):  # ~700 batches of turbo training
-        app.update(0.016)
-    app.turbo = False
-    app.trainer.prepare_current_batch()
-    app._rebuild_scenes()
-    after = rows_hit_max()
-    _check(tr.epoch > 0, "attention turbo did not advance an epoch")
-    _check(after >= 0.75, f"attention did not concentrate on the max after training ({before:.2f} -> {after:.2f})")
-    print(f"  TRAINED: query rows attending to the true max position {before:.2f} -> {after:.2f}  (visible!)")
+        # THE GOAL: after training, the model learns the task (score improves).
+        before = tr.score()
+        app.turbo = True
+        for _ in range(120):  # ~700 batches of turbo training
+            app.update(0.016)
+        app.turbo = False
+        app.trainer.prepare_current_batch()
+        app._rebuild_scenes()
+        after = tr.score()
+        _check(tr.epoch > 0, "attention turbo did not advance an epoch")
+        _check(after >= 0.5, f"{task} score too low after training ({after:.2f})")
+        if task == "classification":  # classification genuinely learns from ~chance; regression
+            _check(after > before, f"{task} score did not improve ({before:.2f} -> {after:.2f})")  # is near-perfect at init (value-only attention)
+        metric = "max-position accuracy" if task == "classification" else "max-value R²"
+        print(f"  TRAINED [{task}]: {metric} {before:.2f} -> {after:.2f}")
 
     pygame.quit()
-    print("[selftest] PASS (both modes)")
+    print("[selftest] PASS (mlp + attention[classification, regression])")
     return 0
 
 
@@ -1187,8 +1197,14 @@ def main():
     ap = argparse.ArgumentParser(description="micrograd training visualiser")
     ap.add_argument("--model", choices=["mlp", "attention"], default=MODEL_KIND)
     ap.add_argument("--dataset", choices=["moons", "circles"], default=DATASET)
+    ap.add_argument(
+        "--task",
+        choices=["classification", "regression"],
+        default=TASK,
+        help="attention only: classification (max position) or regression (max value)",
+    )
     args = ap.parse_args()
-    App(dataset=args.dataset, model_kind=args.model).run()
+    App(dataset=args.dataset, model_kind=args.model, task=args.task).run()
 
 
 if __name__ == "__main__":

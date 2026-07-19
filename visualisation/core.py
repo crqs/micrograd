@@ -44,13 +44,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import micrograd.nn as nnmod
 import micrograd.operations as opsmod
 from micrograd import Tensor
-from micrograd.loss import binary_cross_entropy_with_logits, mse
+from micrograd.loss import binary_cross_entropy_with_logits, mse, softmax_cross_entropy_with_logits
 from micrograd.nn import MLP, Dropout, Linear
 from micrograd.optim import Adam
 
 __all__ = ["AttentionTrainer", "NodeInfo", "Step", "Trainer", "ViewGraph", "make_trainer"]
 
-FRIENDLY = {"@": "matmul", "+": "add", "ReLU": "relu", "swapaxes": "transpose", "*": "scale", "softmax": "softmax"}
+FRIENDLY = {
+    "@": "matmul",
+    "+": "add",
+    "ReLU": "relu",
+    "swapaxes": "transpose",
+    "*": "scale",
+    "/": "scale",
+    "softmax": "softmax",
+    "squeeze": "squeeze",
+    "pool": "pool",
+}
 
 # ======================================================================
 #  OP TAGGING  (viz-only; the micrograd Tensor class carries no op label)
@@ -104,6 +114,9 @@ def tag_ops():
     wrap(Tensor, "squeeze", "squeeze")
     wrap(Tensor, "__mul__", "*")
     wrap(Tensor, "__truediv__", "/")
+    # MeanPool builds its output Tensor directly (no wrapped Tensor op), so tag it here
+    # so the pooled node gets a "pool" label instead of an anonymous one.
+    wrap(nnmod.MeanPool, "__call__", "pool")
     # softmax is a module function; nn.py did `from .operations import softmax`, so the
     # name is bound in both modules — patch both so either call site gets tagged.
     wrap(opsmod, "softmax", "softmax")
@@ -400,141 +413,110 @@ class BatchGraph:
 
 
 # ======================================================================
-#  1b. Attention: one mini-batch's real MaxClassificationModel graph
+#  1b. Attention: a single mini-batch's graph for ANY sequence model
 # ======================================================================
+def _param_names(model) -> dict[int, str]:
+    """Map each parameter tensor's id() -> a readable name by introspecting the model
+    and its child modules for Tensor-valued attributes (e.g. attention.w_q -> "w_q",
+    each linear's w/b). De-duplicated across modules. Purely generic — no knowledge of
+    any specific architecture."""
+    names: dict[int, str] = {}
+    used: dict[str, int] = {}
+    for mod in [model, *getattr(model, "children", [])]:
+        for attr, val in vars(mod).items():
+            for j, item in list(enumerate(val)) if isinstance(val, list) else [(None, val)]:
+                if isinstance(item, Tensor):
+                    base = attr if j is None else f"{attr}{j}"
+                    used[base] = used.get(base, 0) + 1
+                    names[id(item)] = base if used[base] == 1 else f"{base}#{used[base]}"
+    return names
+
+
+_LOSS_META = {
+    binary_cross_entropy_with_logits: ("BCE", "loss"),
+    softmax_cross_entropy_with_logits: ("CE", "ce_loss"),
+    mse: ("MSE", "mse_loss"),
+}
+
+
 class AttentionBatchGraph(BatchGraph):
-    """Same public interface as BatchGraph, but built from the repo's real
-    `MaxRegressionModel` (attention -> mean-pool -> linears -> the max VALUE). We
-    replay the exact forward math of `Attention.__call__` / the model on the model's
-    real parameters (so `optimizer.step` trains it), capture every intermediate to
-    name them, and flag the softmax attention-weights node as the centerpiece.
+    """A single mini-batch's graph for ANY model exposing ``__call__(Tensor, mask)``.
 
-    Why regression (predict the max value) and not classification (predict the max
-    position): the classification model reaches 100% accuracy with ~uniform attention
-    — it never needs to point attention at the max, so there is nothing to see. To
-    output the max value the pooled context must equal the max token's value, which
-    forces attention to concentrate on the max position — exactly what we want to
-    watch appear in the scores. Reuses BatchGraph's `_finalize`, `role`, `friendly`."""
+    Unlike the MLP `BatchGraph`, this knows NOTHING about the model's architecture. It
+    runs the model's *real* forward as a black box under `tag_ops()` — so changing the
+    model in examples/attention never needs a viz edit — builds the loss with the given
+    `criterion`, then labels the produced graph generically: leaves by their
+    parameter/attribute name (or "x"/"const"), interior nodes by op type
+    (matmul/add/softmax/transpose/scale/squeeze/pool) with a running index so keys stay
+    unique. Node names are assigned in a structure-derived order (by depth, then op type,
+    then child names) so the same node keeps the same key across batches and the layout
+    stays put. The single softmax node is flagged as the attention centerpiece. Reuses
+    BatchGraph's `_finalize`, `role`, and `friendly`.
 
-    def __init__(self, model, x_batch, y_target, mask):
+    Exposes `pred_out` (the raw model output for the batch) so a trainer can derive
+    task-specific readouts (predicted position / value) without the viz knowing the task.
+    """
+
+    def __init__(self, model, x_batch, y_batch, mask, criterion):
         self.model = model
-        self.y_batch = np.asarray(y_target, dtype=float)  # the max VALUE target (batch, 1)
-        self.mask = np.asarray(mask, dtype=float)
-        self.loss_role = "mse_loss"
-        self.name, self.order, self.role_by_id = {}, {}, {}
+        self.y_batch = np.asarray(y_batch)  # needed by the loss VJP display
+        self.name, self.order = {}, {}
         self.param_ids, self.node_layer = set(), {}
         self.collapse_rep, self.col_name, self.col_dims = {}, {}, {}
         self.linear_layers = []
         self.highlight: set[int] = set()
-        self._order_ctr = 0
 
-        attn = model.attention
-        b, s = self.mask.shape
-
-        # ---- real forward, mirroring Attention.__call__ + MaxRegressionModel head ----
-        # (predict the max VALUE: attention must PUT WEIGHT ON THE MAX POSITION to read
-        # it, so the attention scores end up pointing at the max — the whole goal here.)
+        # ---- the REAL forward (black box) + the loss ----
+        self.X = Tensor(x_batch)  # Tensor copies its input, so the model may mutate it freely
         with tag_ops():
-            x = Tensor(np.array(x_batch, dtype=float))
-            self.X = x
-            q = x @ attn.w_q
-            k = x @ attn.w_k
-            v = x @ attn.w_v
-            kt = k.swapaxes(-1, -2)
-            scores = q @ kt
-            mask_k = Tensor((1 - self.mask.reshape(b, 1, s)) * -1e9)  # -inf on padded keys
-            masked = scores + mask_k
-            # scale by 1/sqrt(d_k) as a FULL-shape constant, not a scalar: micrograd's
-            # __mul__ backward mishandles bigtensor * scalar-Tensor (broadcast into a
-            # 0-d grad). A full-shape factor is identical maths and sidesteps it.
-            inv = Tensor(np.full(masked.data.shape, 1.0 / np.sqrt(float(attn.d_k))))
-            scaled = masked * inv
-            weights = opsmod.softmax(scaled, axis=-1)  # <-- attention weights (the centerpiece)
-            ctx = weights @ v
-            pooled = model.mean_pool(ctx, self.mask)  # average context over valid positions
-            h = pooled
-            lin_outs = []
-            for lin in model.linears:
-                h = lin(h)
-                lin_outs.append(h)
-            self.pred = np.asarray(h.data, dtype=float)  # predicted max value (batch, 1)
-            self.loss = mse(h, self.y_batch)
+            pred = model(self.X, mask)
+            self.loss = criterion(pred, self.y_batch)
+        self.pred_out = np.asarray(pred.data)  # raw output (position logits or the value)
 
-        # ---- max-position info (for the renderer's max marker + sequence readout) ----
-        raw = np.asarray(x_batch, dtype=float)[:, :, 0]  # raw sequence values (batch, seq)
-        self.seq_vals = raw
-        self.max_pos = np.argmax(np.where(self.mask > 0, raw, -np.inf), axis=1)  # (batch,)
+        loss_name, self.loss_role = _LOSS_META.get(criterion, ("loss", "loss"))
 
-        # ---- name leaves / ops, mark groups + the highlight node ----
-        self._leaf(x, "x")
-        self._leaf(attn.w_q, "Wq", param=True)
-        self._leaf(attn.w_k, "Wk", param=True)
-        self._leaf(attn.w_v, "Wv", param=True)
-        self._leaf(mask_k, "mask(K)")
-        self._leaf(inv, "1/sqrt(dk)")  # the 1/sqrt(d_k) scale constant
+        # ---- generic labelling of the produced graph ----
+        topo = self._build_topo(self.loss)
+        depth = {}
+        for t in topo:
+            depth[id(t)] = 0 if not t.children else 1 + max(depth[id(c)] for c in t.children)
 
-        self._op(q, "Q", "matmul")
-        self._op(k, "K", "matmul")
-        self._op(v, "V", "matmul")
-        self._op(kt, "K^T", "transpose")
-        self._op(scores, "QK^T", "matmul")
-        self._op(masked, "QK^T+mask", "add")
-        self._op(scaled, "scaled", "scale")
-        self._op(weights, "attn", "softmax")
-        self.highlight.add(id(weights))  # THE centerpiece
-        self._op(ctx, "context", "matmul")
-        self._op(pooled, "pool", "pool")
+        # leaves first: input, parameters, and forward-time constants
+        param_ids_all = {id(p) for p in model.parameters}
+        pname = _param_names(model)
+        consts = 0
+        for t in topo:
+            if t.children or t is self.loss:
+                continue
+            if t is self.X:
+                self.name[id(t)], self.order[id(t)] = "x", 0
+            elif id(t) in param_ids_all:
+                self.param_ids.add(id(t))
+                self.name[id(t)] = pname.get(id(t), f"W{len(self.param_ids)}")
+                self.order[id(t)] = len(self.param_ids)
+            else:  # a constant created during the forward (mask fills, scales, ...)
+                consts += 1
+                self.name[id(t)] = f"const{consts}"
 
-        attn_ops = [q, k, v, kt, scores, masked, scaled, weights, ctx]
-        for t in attn_ops:
-            self.collapse_rep[id(t)] = id(pooled)
-        self.col_name[id(pooled)] = "Attention"
-        self.linear_layers.append(
-            {
-                "k": 0,
-                "members": {id(t) for t in [*attn_ops, pooled, attn.w_q, attn.w_k, attn.w_v, mask_k]},
-                "label": f"Attention + pool  (d_k={attn.d_k}, d_v={attn.d_v})",
-                "out": id(pooled),
-            }
-        )
+        # interior op nodes: name in a structure-stable order so keys don't jump between
+        # batches (t.children is a set, so raw topo order is not reproducible).
+        interior = [t for t in topo if t.children and t is not self.loss]
+        by_depth: dict[int, list] = defaultdict(list)
+        for t in interior:
+            by_depth[depth[id(t)]].append(t)
+        counts: dict[str, int] = {}
+        for d in sorted(by_depth):  # children (lower depth) are named before parents
+            role_of = lambda t: FRIENDLY.get(op_of(t), op_of(t) or "node")  # noqa: E731
+            child_names = lambda t: tuple(sorted(self.name.get(id(c), "?") for c in t.children))  # noqa: E731
+            for t in sorted(by_depth[d], key=lambda t: (role_of(t), child_names(t))):
+                role = role_of(t)
+                counts[role] = counts.get(role, 0) + 1
+                self.name[id(t)] = f"{role}{counts[role]}"
+                if op_of(t) == "softmax":
+                    self.highlight.add(id(t))  # the attention-weights centerpiece
 
-        for i, (lin, out) in enumerate(zip(model.linears, lin_outs, strict=True), start=1):
-            members: set[int] = set()
-            t = out
-            if op_of(t) == "ReLU":
-                self._op(t, f"reluL{i}", "relu")
-                members.add(id(t))
-                (t,) = tuple(t.children)
-            if op_of(t) == "+":
-                self._op(t, f"addL{i}", "add")
-                members.add(id(t))
-                mm = next(c for c in t.children if op_of(c) == "@")
-                self._op(mm, f"matmulL{i}", "matmul")
-                members.add(id(mm))
-            for oid in members:
-                self.collapse_rep[oid] = id(out)
-            self.col_name[id(out)] = f"Linear{i}"
-            self._leaf(lin.w, f"Wl{i}", param=True)
-            self._leaf(lin.b, f"bl{i}", param=True)
-            members |= {id(lin.w), id(lin.b)}
-            din, dout = int(lin.w.shape[0]), int(lin.w.shape[1])
-            self.linear_layers.append(
-                {"k": i, "members": members, "label": f"Linear {i}  ({din}->{dout})", "out": id(out)}
-            )
-
-        self.name[id(self.loss)] = "MSE"
+        self.name[id(self.loss)] = loss_name
         self._finalize()
-
-    def _leaf(self, t, nm, param=False):
-        self.name[id(t)] = nm
-        self.order[id(t)] = self._order_ctr
-        self._order_ctr += 1
-        if param:
-            self.param_ids.add(id(t))
-
-    def _op(self, t, nm, role):
-        self.name[id(t)] = nm
-        self.role_by_id[id(t)] = role
 
 
 # ======================================================================
@@ -545,6 +527,7 @@ def _make_views(bg: BatchGraph) -> dict:
 
 
 def _view(bg: BatchGraph, collapse: bool) -> ViewGraph:
+    collapse = collapse and bool(bg.collapse_rep)  # nothing to collapse -> show the detailed graph
     if not collapse:
         node_ids = list(bg.ids)
         edges = [(id(c), id(t)) for t in bg.topo for c in t.children]
@@ -917,64 +900,62 @@ class Trainer:
 
 
 # ======================================================================
-#  5. Attention trainer — real MaxClassificationModel, one mini-batch at a time
+#  5. Attention trainer — drives the real sequence models, one mini-batch at a time
 # ======================================================================
-def _attention_pred(model, x_batch: np.ndarray, mask: np.ndarray) -> Tensor:
-    """Connected forward for the fast/turbo path (mirrors Attention.__call__ +
-    MaxRegressionModel head -> the predicted max value). Full-shape 1/sqrt(d_k)
-    factor avoids the __mul__ scalar-broadcast bug."""
-    attn = model.attention
-    b, s = mask.shape
-    x = Tensor(np.array(x_batch, dtype=float))
-    scores = (x @ attn.w_q) @ (x @ attn.w_k).swapaxes(-1, -2)
-    masked = scores + Tensor((1 - mask.reshape(b, 1, s)) * -1e9)
-    scaled = masked * Tensor(np.full(masked.data.shape, 1.0 / np.sqrt(float(attn.d_k))))
-    ctx = opsmod.softmax(scaled, axis=-1) @ (x @ attn.w_v)
-    h = model.mean_pool(ctx, mask)
-    for lin in model.linears:
-        h = lin(h)
-    return h
-
-
 class AttentionTrainer:
-    """Mirror of `Trainer` for the attention model (real `MaxRegressionModel`,
-    predicting the max value). Same public surface the renderer uses (views / state /
-    advance_batch / fast_train_batch / prepare_current_batch / restart). No 2D
-    decision boundary (sequence task) — instead it exposes `attn_info`: the current
-    sample's sequence values + true/pred max, so the renderer can mark the max on the
-    attention-weights matrix."""
+    """Mirror of `Trainer` for the attention model. `task` picks the real repo model:
+    "classification" -> `MaxClassificationModel` (predict the max POSITION), or
+    "regression" -> `MaxRegressionModel` (predict the max VALUE). Same public surface
+    the renderer uses (views / state / advance_batch / fast_train_batch /
+    prepare_current_batch / restart). No 2D decision boundary (sequence task) — instead
+    it exposes `attn_info` (the current sample's sequence + true/pred max) so the
+    renderer can mark the max on the attention-weights matrix."""
 
     HIGH = 10
     MIN_SEQ_LEN = 4
     MAX_SEQ_LEN = 5  # 4 valid + 1 padded key position (so masking is visible)
+    D_POS = 2  # sinusoidal positional-encoding dims (classification only) -> n_in = 1 + d_pos
 
-    def __init__(self, batch_size, seed, lr, n_samples):
+    def __init__(self, batch_size, seed, lr, n_samples, task="classification"):
         self.batch_size = batch_size
         self.seed = seed
         self.lr = lr
         self.n_samples = n_samples
+        self.task = task
         self._setup()
 
     def _setup(self):
-        # the example pulls in matplotlib; import lazily to keep core light
-        from examples.attention.maximum_regression import (
-            MaxRegressionModel,
-            make_dataset as make_seq_dataset,
-        )
+        # the examples pull in matplotlib; import lazily to keep core light. This is the
+        # ONLY place that knows the concrete models — it constructs them and picks the
+        # criterion. Everything downstream just calls model(x, mask), so changing a
+        # model's *forward* never reaches the viz; only a changed *constructor* does.
+        from examples.attention.utils import make_dataset  # shared dataset builder
 
         np.random.seed(self.seed)
-        X, _y_pos, mask = make_seq_dataset(
+        X, y_pos, mask = make_dataset(
             n_samples=self.n_samples,
             high=self.HIGH,
             min_seq_len=self.MIN_SEQ_LEN,
             max_seq_len=self.MAX_SEQ_LEN,
+            d_pos=self.D_POS,
         )
-        # regression target: the max VALUE among valid positions (batch, 1)
-        y = (X[:, :, 0] * mask).max(axis=1, keepdims=True)
+        if self.task == "classification":
+            from examples.attention.maximum_classification import MaxClassificationModel
+
+            # target: the argmax POSITION; d_v=1 so the head-less model emits one logit/pos
+            y = y_pos
+            self.criterion = softmax_cross_entropy_with_logits
+            self.model = MaxClassificationModel(n_in=1 + self.D_POS, d_k=8, high=self.HIGH)
+        else:
+            from examples.attention.maximum_regression import MaxRegressionModel
+
+            # target: the max VALUE among valid positions
+            y = (X[:, :, 0] * mask).max(axis=1, keepdims=True)
+            self.criterion = mse
+            self.model = MaxRegressionModel(n_in=1 + self.D_POS, d_k=8, d_v=8, hidden_dims=[8], out_dim=1)
+
         n = (len(X) // self.batch_size) * self.batch_size  # whole batches only
         self.X_train, self.y_train, self.mask_train = X[:n], y[:n], mask[:n]
-
-        self.model = MaxRegressionModel(n_in=1, d_k=8, d_v=8, hidden_dims=[8], out_dim=1)
         self.optimizer = Adam(parameters=self.model.parameters, lr=self.lr)
 
         self.nb_samples = len(self.X_train)
@@ -1006,17 +987,24 @@ class AttentionTrainer:
         idx, xb, yb, mb = self._slice()
         self.batch_indices = idx
         self.optimizer.zero_grad()
-        bg = AttentionBatchGraph(self.model, xb, yb, mb)  # real forward + stepped backward
+        bg = AttentionBatchGraph(self.model, xb, yb, mb, self.criterion)  # real forward + stepped backward
         self.views = _make_views(bg)
         self.batch_loss = float(bg.loss.data)
-        # sample-0 context for the "see the max" markers
+        # sample-0 context for the "see the max" markers (derived here, not in the graph)
+        raw0 = np.asarray(xb, dtype=float)[0, :, 0]  # (seq,) raw values of sample 0
+        mask0 = np.asarray(mb, dtype=float)[0]
         self.attn_info = {
-            "seq_vals": bg.seq_vals[0],  # (seq,) raw values
-            "mask": self.mask_train[idx][0],  # (seq,)
-            "max_pos": int(bg.max_pos[0]),  # true argmax key position
-            "true_max": float(yb[0, 0]),
-            "pred_max": float(bg.pred[0, 0]),
+            "task": self.task,
+            "seq_vals": raw0,
+            "mask": mask0,
+            "max_pos": int(np.argmax(np.where(mask0 > 0, raw0, -np.inf))),
         }
+        if self.task == "classification":
+            self.attn_info["true_pos"] = int(yb[0, 0])  # label: which position holds the max
+            self.attn_info["pred_pos"] = int(np.argmax(bg.pred_out[0]))  # model's predicted position
+        else:
+            self.attn_info["true_max"] = float(yb[0, 0])  # the max value
+            self.attn_info["pred_max"] = float(bg.pred_out[0, 0])  # model's predicted value
         self._pending = True
 
     def advance_batch(self) -> bool:
@@ -1034,9 +1022,20 @@ class AttentionTrainer:
             return self._advance_cursor()
         _idx, xb, yb, mb = self._slice()
         self.optimizer.zero_grad()
-        mse(_attention_pred(self.model, xb, mb), yb).backward()
+        self.criterion(self.model(Tensor(xb), mb), yb).backward()  # the REAL forward, no mirror
         self.optimizer.step()
         return self._advance_cursor()
+
+    def score(self) -> float:
+        """A single "did it learn" number in [0, 1], per task. Classification: fraction
+        of the train set whose predicted max POSITION matches the label. Regression:
+        squared correlation (R²-ish) between the predicted and true max VALUE."""
+        out = np.asarray(self.model(Tensor(self.X_train), self.mask_train).data)
+        if self.task == "classification":
+            return float((np.argmax(out, axis=-1) == self.y_train.reshape(-1)).mean())
+        pred, true = out.reshape(-1), self.y_train.reshape(-1)
+        r = np.corrcoef(pred, true)[0, 1] if pred.std() > 0 else 0.0
+        return float(0.0 if np.isnan(r) else r**2)
 
     def state(self) -> TrainState:
         return TrainState(self.epoch, self.batch_in_epoch, self.nb_batches, self.batch_loss)
@@ -1045,10 +1044,11 @@ class AttentionTrainer:
         self._setup()
 
 
-def make_trainer(kind, *, seed, lr, n_samples, dataset, arch, batch_size, dropout):
-    """Pick which model's graph the visualiser builds. Everything downstream is shared."""
+def make_trainer(kind, *, seed, lr, n_samples, dataset, arch, batch_size, dropout, task="classification"):
+    """Pick which model's graph the visualiser builds. Everything downstream is shared.
+    `task` (attention only) selects classification (max position) or regression (max value)."""
     if kind == "mlp":
         return Trainer(dataset, arch, batch_size, seed, dropout, lr, n_samples)
     if kind == "attention":
-        return AttentionTrainer(batch_size=batch_size, seed=seed, lr=lr, n_samples=n_samples)
+        return AttentionTrainer(batch_size=batch_size, seed=seed, lr=lr, n_samples=n_samples, task=task)
     raise ValueError(f"Unknown MODEL_KIND: {kind!r} (expected 'mlp' or 'attention')")
