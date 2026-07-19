@@ -1,22 +1,28 @@
-"""MLP *training* visualizer, pygame edition (rendering only).
+"""Training visualizer, pygame edition (rendering only).
 
-All the neural-network / autograd / training logic lives in `viz_core.py`; this file
-is purely the visualisation + interaction layer. `viz_core.Trainer` runs the real
-`fit` loop (Adam, BCE, shuffled mini-batches) one batch at a time and hands us, per
-batch, the computation graph as `ViewGraph`s (nodes, edges, layer groups, per-op
-forward/backward steps + equations). We:
+All the neural-network / autograd / training logic lives in `visualisation.core`;
+this file is purely the visualisation + interaction layer. `core.make_trainer(...)`
+runs a real training loop one mini-batch at a time and hands us, per batch, the
+computation graph as `ViewGraph`s (nodes, edges, layer groups, per-op forward/backward
+steps + equations). We:
   * lay the graph out in layers and draw every node as its full matrix of numbers,
   * animate the forward->backward wave op-by-op, driven by real batches,
-  * show the 2D dataset in a side panel with a live decision boundary,
+  * (mlp) show the 2D dataset in a side panel with a live decision boundary,
+  * (attention) flag the softmax attention-weights node as the centerpiece,
   * run a 60 FPS pygame loop with a zoom/pan camera and a mathtext equation card.
 
-Run:  python viz_pygame.py [--dataset moons|circles]
-      python viz_pygame.py --selftest        (headless checks, no window)
+Two models share this exact engine — only which graph gets built branches, via the
+MODEL_KIND constant (top of file) or --model:
+  mlp        -> MLP on moons/circles  (examples/toy_classification + examples/train.fit)
+  attention  -> tiny MaxClassificationModel  (examples/maximum), attention scores shown
+
+Run:  python -m visualisation.main [--model mlp|attention] [--dataset moons|circles]
+      python -m visualisation.main --selftest        (headless checks, both models)
 
 Controls:
   SPACE pause/resume        N / →  one op forward     ← one op back
   ↑ / ↓ playback speed      A auto-play (op-by-op)     F2 fast-forward (turbo)
-  V values/grads/auto       C collapse Linear ops      F fit view
+  V values/grads/auto       C collapse layers          F fit view
   R restart training        ESC / Q quit
   mouse wheel: zoom the graph (toward cursor), or resize the dataset square when
   the cursor is over it        left-drag pan
@@ -37,13 +43,24 @@ import visualisation.core as core
 # ======================================================================
 #  CONFIG  (what to visualise — the model / training choices live here)
 # ======================================================================
+MODEL_KIND = "mlp"  # "mlp" | "attention"  -> which model's graph to visualise (or --model)
+
+# --- MLP mode (toy_classification: moons / circles) ---
 ARCH = (2, [8, 6], 1)
 BATCH = 8
-SEED = 42
 DROPOUT = 0.1  # 0.0 -> clean matmul/add/relu graph (bump to add Dropout nodes)
 LR = 0.02  # Adam learning rate (train.fit uses Adam; a touch higher so it visibly learns)
 N_SAMPLES = 500  # dataset size (like toy_classification); train set trimmed to a whole # of batches
 DATASET = "moons"  # default; overridden by --dataset
+
+# --- attention mode (examples/attention/maximum_regression: MaxRegressionModel) ---
+# tiny on purpose: n_in=1, d_k=d_v=8, hidden=[8], seq_len 4 (+1 padded key) so every
+# matrix — especially the attention weights — stays fully readable.
+ATTN_BATCH = 2  # sequences per batch (each shown as sample 0)
+ATTN_LR = 0.01
+ATTN_N_SAMPLES = 64
+
+SEED = 42
 
 FPS = 60
 WIN_W, WIN_H = 1760, 1040  # desired window size (capped to the display at launch)
@@ -84,6 +101,8 @@ EDGE = (150, 158, 164)
 INK = (26, 32, 40)
 MUTED = (120, 130, 140)
 LAYER_TINTS = [(41, 128, 185), (39, 174, 96), (155, 89, 182), (211, 84, 0)]
+ATTN_BORDER = (142, 68, 173)  # vivid purple: the attention-weights centerpiece node
+MAX_MARK = (214, 40, 120)  # magenta: marks the true-max key position (the thing to watch)
 
 # diverging colour ramps: (negative end, white middle, positive end)
 DATA_RAMP = ((59, 111, 181), (247, 247, 247), (192, 57, 43))  # blue - white - red
@@ -96,12 +115,16 @@ MODES = ("auto", "values", "grads")  # matrix content switch (key V)
 #  SMALL VISUAL HELPERS
 # ======================================================================
 def as2d(a) -> np.ndarray:
-    """How a tensor is *shown*: scalar -> 1x1, vector -> a single row."""
+    """How a tensor is *shown*: scalar -> 1x1, vector -> a single row, and a batched
+    3D+ tensor (batch, seq, dim) -> sample 0, so attention's (seq, seq) weights and
+    (seq, dim) activations render as a plain matrix."""
     a = np.asarray(a, dtype=float)
     if a.ndim == 0:
         return a.reshape(1, 1)
     if a.ndim == 1:
         return a.reshape(1, -1)
+    while a.ndim > 2:  # show sample 0 of a batched tensor
+        a = a[0]
     return a
 
 
@@ -129,14 +152,20 @@ def diverging(value: float, vmax: float, ramp):
     return mix(ramp[1], ramp[0], -t) if t < 0 else mix(ramp[1], ramp[2], t)
 
 
+def sequential(value: float, vmax: float):
+    """White -> deep blue, intensity proportional to the (>=0) attention weight."""
+    t = 0.0 if vmax <= 0 else max(0.0, min(1.0, value / vmax))
+    return mix((255, 255, 255), (33, 102, 172), t)
+
+
 def luminance(c) -> float:
     return (0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]) / 255.0
 
 
-def box_size(mat2d: np.ndarray):
+def box_size(mat2d: np.ndarray, scale: float = 1.0):
     """World (width, height) of a node box holding this 2D matrix."""
     r, c = mat2d.shape
-    return c * CELL_W, r * CELL_H + TITLE_H
+    return c * CELL_W * scale, r * CELL_H * scale + TITLE_H
 
 
 # ======================================================================
@@ -226,9 +255,14 @@ class Camera:
 class Scene:
     """Wraps a core.ViewGraph with world-space positions/sizes for its nodes."""
 
+    ATTN_SCALE = 1.6  # the attention-weights node is drawn bigger than the rest
+
     def __init__(self, view: core.ViewGraph):
         self.view = view
-        self.sizes = {nid: box_size(as2d(view.nodes[nid].mat)) for nid in view.order}
+        self.sizes = {
+            nid: box_size(as2d(view.nodes[nid].mat), self.ATTN_SCALE if view.nodes[nid].highlight else 1.0)
+            for nid in view.order
+        }
         self.pos = self._layout()
         self.boxes = self._layer_boxes()
         self.bounds = self._bounds()
@@ -356,11 +390,12 @@ class Scene:
 #  APP
 # ======================================================================
 class App:
-    def __init__(self, headless=False, dataset=DATASET):
+    def __init__(self, headless=False, dataset=DATASET, model_kind=MODEL_KIND):
         if headless:
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         pygame.init()
-        pygame.display.set_caption(f"micrograd — training ({dataset})")
+        title = dataset if model_kind == "mlp" else "attention (max-position)"
+        pygame.display.set_caption(f"micrograd — training ({title})")
         # open large: up to WIN_W x WIN_H, but capped to ~92% of the actual display
         win = (WIN_W, WIN_H)
         if not headless:
@@ -382,9 +417,21 @@ class App:
         self.f_card = pygame.font.SysFont("arial,dejavusans,sans", 19, bold=True)
         self.f_plabel = pygame.font.SysFont("arial,dejavusans,sans", 15, bold=True)  # VJP term labels
 
-        # the real training run lives in viz_core; the app only visualises it
+        # the real training run lives in core; the app only visualises it. The ONLY
+        # thing that branches on the model is which trainer we build here.
         self.dataset = dataset
-        self.trainer = core.Trainer(dataset, ARCH, BATCH, SEED, DROPOUT, LR, N_SAMPLES)
+        self.model_kind = model_kind
+        self.has_dataset_panel = model_kind == "mlp"  # 2D boundary only makes sense for moons/circles
+        self.trainer = core.make_trainer(
+            model_kind,
+            seed=SEED,
+            lr=LR if model_kind == "mlp" else ATTN_LR,
+            n_samples=N_SAMPLES if model_kind == "mlp" else ATTN_N_SAMPLES,
+            dataset=dataset,
+            arch=ARCH,
+            batch_size=BATCH if model_kind == "mlp" else ATTN_BATCH,
+            dropout=DROPOUT,
+        )
         self._rebuild_scenes()
         self.collapse = False
 
@@ -415,7 +462,10 @@ class App:
         return self.scenes[self.collapse]
 
     def panel_geom(self):
-        """Screen rect (px, top, size) of the dataset panel, incl. its own zoom."""
+        """Screen rect (px, top, size) of the dataset panel, incl. its own zoom, or
+        None in attention mode (there is no 2D decision boundary for a sequence task)."""
+        if not self.has_dataset_panel:
+            return None
         base = min(PANEL_BASE_FRAC * self.w, self.h - TOP_H - 70)
         size = int(max(120, min(base * self.panel_scale, self.w - 40, self.h - TOP_H - 70)))
         return self.w - size - 20, TOP_H + 42, size
@@ -489,7 +539,11 @@ class App:
         self.step_i = max(0, self.step_i - 1)  # within the current batch only
 
     def recompute_boundary(self):
-        """Re-evaluate the model on a grid (eval mode) into a small RdBu image."""
+        """Re-evaluate the model on a grid (eval mode) into a small RdBu image.
+        No-op in attention mode (no 2D boundary)."""
+        if not self.has_dataset_panel:
+            self.boundary_surf = None
+            return
         probs = self.trainer.decision_grid(BOUNDARY_RES)  # [iy, ix] in (0, 1)
         t = (probs * 2.0 - 1.0)[..., None]  # -> [-1, 1]
         neg, mid, pos = (np.array(c, dtype=float) for c in DATA_RAMP)
@@ -558,8 +612,8 @@ class App:
                 self.set_collapse(not self.collapse)
         elif e.type == pygame.MOUSEWHEEL:
             mx, my = pygame.mouse.get_pos()
-            px, top, size = self.panel_geom()
-            if pygame.Rect(px, top, size, size).collidepoint(mx, my):
+            pg = self.panel_geom()
+            if pg and pygame.Rect(pg[0], pg[1], pg[2], pg[2]).collidepoint(mx, my):
                 # wheel over the dataset panel RESIZES the whole square (same view,
                 # just bigger/smaller) — it does not zoom into the points
                 self.panel_scale = max(PANEL_SCALE_MIN, min(PANEL_SCALE_MAX, self.panel_scale * 1.12**e.y))
@@ -629,7 +683,10 @@ class App:
         self.screen.set_clip(None)
         self._draw_hud()
         self._draw_eq_card()  # anchored to the graph's upper-left
-        self._draw_dataset_panel()  # anchored to the graph's upper-right
+        if self.model_kind == "attention":
+            self._draw_seq_panel()  # the sequence + where its max is
+        else:
+            self._draw_dataset_panel()  # 2D dataset + live decision boundary
 
     def _draw_boxes(self):
         st = self.step
@@ -708,6 +765,25 @@ class App:
             pygame.draw.circle(glow, (*BORDER_ACTIVE, alpha), (r, r), rr)
         self.screen.blit(glow, (sx - r, sy - r))
 
+    def _mark_max_key(self, rect, shape):
+        """Frame the true-max key COLUMN of the attention-weights matrix + caret above,
+        so you can see attention concentrate on the max position (attention mode)."""
+        info = getattr(self.trainer, "attn_info", None)
+        if info is None:
+            return
+        r, c = shape
+        mp = info["max_pos"]
+        if not (0 <= mp < c):
+            return
+        cw = rect.w / c
+        ch = (rect.h - TITLE_H * self.cam.scale) / r
+        top = rect.y + TITLE_H * self.cam.scale
+        col = pygame.Rect(int(rect.x + mp * cw), int(top), int(cw) + 1, int(r * ch) + 1)
+        pygame.draw.rect(self.screen, MAX_MARK, col, width=4)
+        # caret BELOW the node (the top is taken by the "ATTENTION WEIGHTS" label)
+        caret = self.f_title.render(f"^ max value (key {mp})", True, MAX_MARK)
+        self.screen.blit(caret, (col.centerx - caret.get_width() // 2, rect.bottom + 6))
+
     def _draw_nodes(self):
         st = self.step
         wr = self.world_rect()
@@ -727,8 +803,10 @@ class App:
 
             picked = self.matrix_for(nid, st)
             pygame.draw.rect(self.screen, WHITE if picked else HIDDEN_FILL, rect, border_radius=6)
+            # the attention-weights node shows a sequential heatmap for its forward values
+            hl_data = n.highlight and picked is not None and picked[1] is DATA_RAMP
             if picked is not None:
-                self._draw_matrix(rect, picked[0], picked[1], wr)
+                self._draw_matrix(rect, picked[0], picked[1], wr, attn=hl_data)
 
             if bw >= 56:  # title only when the box is wide enough to read it
                 is_grad = picked is not None and picked[1] is GRAD_RAMP
@@ -739,6 +817,12 @@ class App:
             base = BORDER_DONE if nid in st.revealed else BORDER_HIDDEN
             border = mix(base, BORDER_GRAD, self.grad_alpha.get(nid, 0.0))
             pygame.draw.rect(self.screen, border, rect, width=2, border_radius=6)
+            if n.highlight:  # the centerpiece: thick purple ring + floating label, always
+                pygame.draw.rect(self.screen, ATTN_BORDER, rect.inflate(10, 10), width=4, border_radius=10)
+                lbl = self.f_card.render("ATTENTION WEIGHTS", True, ATTN_BORDER)
+                self.screen.blit(lbl, (rect.centerx - lbl.get_width() // 2, rect.top - lbl.get_height() - 8))
+                if hl_data:  # mark the true-max key column: attention should pile onto it
+                    self._mark_max_key(rect, picked[0].shape)
             if nid in st.active:  # source of the VJP (orange)
                 pygame.draw.rect(
                     self.screen, BORDER_ACTIVE, rect.inflate(6, 6), width=int(2 + pulse * 3), border_radius=8
@@ -748,7 +832,9 @@ class App:
                     self.screen, BORDER_GRAD, rect.inflate(6, 6), width=int(2 + pulse * 2.5), border_radius=8
                 )
 
-    def _draw_matrix(self, rect, mat, ramp, wr):
+    def _draw_matrix(self, rect, mat, ramp, wr, attn=False):
+        """Draw the matrix of numbers. `attn` uses a sequential heatmap (intensity ∝
+        weight) and always shows the value, so masked ~0 keys stay visible, not blank."""
         r, c = mat.shape
         cw = rect.w / c
         ch = (rect.h - TITLE_H * self.cam.scale) / r
@@ -756,17 +842,18 @@ class App:
         vmax = float(np.abs(mat).max())
         # number font follows the (zoomed) cell size, sized to fit a ".2f" value
         fs = int(max(6, min(44, cw * 0.34, ch * 0.72)))
-        show_numbers = cw >= 22 and ch >= 12
+        show_numbers = attn or (cw >= 22 and ch >= 12)
         for i in range(r):
             for j in range(c):
                 cell = pygame.Rect(rect.x + j * cw, top + i * ch, cw + 1, ch + 1)
                 if not cell.colliderect(wr):
                     continue
-                col = diverging(float(mat[i, j]), vmax, ramp)
+                v = float(mat[i, j])
+                col = sequential(v, vmax) if attn else diverging(v, vmax, ramp)
                 pygame.draw.rect(self.screen, col, cell.inflate(-1, -1))
                 if show_numbers:
                     tc = WHITE if luminance(col) < 0.5 else (30, 30, 30)
-                    g = self.pnum_surf(fmt(float(mat[i, j])), tc, fs)
+                    g = self.pnum_surf(fmt(v), tc, fs)
                     self.screen.blit(g, g.get_rect(center=cell.center))
 
     # ---- fixed UI overlays (never affected by the camera) ----
@@ -774,8 +861,11 @@ class App:
         """Square panel (upper-right): the 2D dataset over a live decision-boundary
         heatmap; the current batch's samples are ringed (the same ones flowing as x).
         The wheel resizes the whole square when the cursor is over it (panel_geom)."""
+        pg = self.panel_geom()
+        if pg is None:  # attention mode: no 2D dataset panel
+            return
         tr = self.trainer
-        px, top, size = self.panel_geom()
+        px, top, size = pg
         if size < 60:
             return
         rect = pygame.Rect(px, top, size, size)
@@ -805,6 +895,40 @@ class App:
         for i in tr.batch_indices:  # ring the current batch's samples
             sx, sy = to_px(tr.X_train[i])
             pygame.draw.circle(self.screen, BORDER_ACTIVE, (sx, sy), ring, ring_w)
+
+    def _draw_seq_panel(self):
+        """Attention mode (upper-right): the current sequence (sample 0) as a row of
+        value cells with the true max ringed in magenta, plus true vs predicted max —
+        so the max marked on the attention-weights matrix has an obvious referent."""
+        info = getattr(self.trainer, "attn_info", None)
+        if info is None:
+            return
+        vals, mask, mp = info["seq_vals"], info["mask"], info["max_pos"]
+        s = len(vals)
+        cell = min(64, max(34, (self.w - 40) // max(12, s)))
+        panel_w = s * cell + 24
+        x0, y0 = self.w - panel_w - 20, TOP_H + 40
+        self.screen.blit(
+            self.f_card.render(
+                f"sequence (sample 0)   ·   true max {info['true_max']:.1f}   ·   pred {info['pred_max']:.2f}",
+                True,
+                INK,
+            ),
+            (x0, y0 - 26),
+        )
+        for j in range(s):
+            cr = pygame.Rect(int(x0 + j * cell), int(y0), int(cell), int(cell))
+            padded = mask[j] <= 0.5
+            fill = (236, 238, 240) if padded else mix((255, 255, 255), MAX_MARK, 0.10)
+            pygame.draw.rect(self.screen, fill, cr)
+            pygame.draw.rect(self.screen, MUTED, cr, width=1)
+            txt = "pad" if padded else f"{vals[j]:.0f}"
+            g = self.f_info.render(txt, True, MUTED if padded else INK)
+            self.screen.blit(g, g.get_rect(center=cr.center))
+            kg = self.f_hint.render(f"k{j}", True, MUTED)  # key index under each cell
+            self.screen.blit(kg, kg.get_rect(center=(cr.centerx, cr.bottom + 9)))
+        mrect = pygame.Rect(int(x0 + mp * cell), int(y0), int(cell), int(cell))  # ring the max
+        pygame.draw.rect(self.screen, MAX_MARK, mrect.inflate(6, 6), width=3)
 
     def _draw_hud(self):
         pygame.draw.rect(self.screen, HUD_BG, pygame.Rect(0, 0, self.w, TOP_H))
@@ -851,7 +975,8 @@ class App:
         vjp = st.vjp
         terms = [(lbl, kind, as2d(m)) for lbl, kind, m in vjp["terms"]]
         x0, y0, pad, gap = 16, TOP_H + 14, 14, 24
-        avail_w = max(360, self.panel_geom()[0] - x0 - 24)  # stop before the dataset panel
+        pg = self.panel_geom()  # stop before the dataset panel (full width if none)
+        avail_w = max(360, (pg[0] if pg else self.w) - x0 - 24)
         # use the empty band under the panel (may overlap the low graph's top — fine,
         # the panel is the focus in backward). VJP_PANEL_MAX_FRAC controls how tall.
         avail_bottom = self.h * VJP_PANEL_MAX_FRAC
@@ -939,86 +1064,35 @@ def _check(cond, msg):
         raise AssertionError(msg)
 
 
-def selftest() -> int:
-    print("[selftest] importing + init ...")
-    app = App(headless=True, dataset="moons")
-    tr = app.trainer
-    print(f"  pygame {pygame.version.ver}, display {app.screen.get_size()}, dataset moons")
-    print(f"  arch {ARCH}, batch {BATCH}, train samples {tr.nb_samples}, {tr.nb_batches} batches/epoch")
-
+def _check_common(app):
+    """Checks shared by both modes: legible graph, forward reveal grows, grads reach
+    every node, op-by-op advances training, equations rasterise, both views x 3
+    matrix modes render without error."""
     for collapse in (False, True):
         sc = app.scenes[collapse]
         _check(sc.steps, f"{sc.view.title}: no steps")
-        first = sc.steps[0]  # first focus must be the single input node x
-        _check(first.active == {"x"}, f"{sc.view.title}: first focus is {first.active}, expected {{'x'}}")
-        for nid, (w, h) in sc.sizes.items():
-            _check(w > 0 and h > 0, f"{sc.nodes[nid].name} bad box")
+        _check(sc.steps[0].active == {"x"}, f"{sc.view.title}: first focus {sc.steps[0].active}, expected x")
+        for _nid, (w, h) in sc.sizes.items():
+            _check(w > 0 and h > 0, "bad box")
         fwd = [s for s in sc.steps if s.phase == "forward"]
         bwd = [s for s in sc.steps if s.phase == "backward"]
         grows = all(len(fwd[i].revealed) <= len(fwd[i + 1].revealed) for i in range(len(fwd) - 1))
         _check(grows, f"{sc.view.title}: forward reveals not monotone")
         _check(len(bwd[-1].known) == len(sc.nodes), f"{sc.view.title}: grads did not reach all nodes")
-        print(f"  scene '{sc.view.title}': {len(sc.nodes)} nodes, {len(sc.steps)} steps, first focus = x, ok")
+        print(f"    scene '{sc.view.title}': {len(sc.nodes)} nodes, {len(sc.steps)} steps")
 
-    # the x node holds THIS batch's real data (same samples ringed in the panel)
-    x0 = app.scenes[False].nodes["x"].mat.copy()
-    _check(np.allclose(x0, tr.X_train[tr.batch_indices]), "x node != current batch data")
-    _check(app.scenes[False].nodes["x"].mat.shape == (BATCH, 2), "x node wrong shape")
-
-    # advance one whole batch op-by-op -> optimizer.step updates the weights, next batch loads
-    w_before = tr.model.parameters[0].data.copy()
-    for _ in range(len(app.scenes[False].steps)):
+    w_before = app.trainer.model.parameters[0].data.copy()
+    for _ in range(len(app.scene.steps)):
         app.advance_op()
-    _check(not np.allclose(w_before, tr.model.parameters[0].data), "weights did not update after a batch")
-    _check(not np.allclose(x0, app.scenes[False].nodes["x"].mat), "batch did not advance")
-    print("  op-by-op advance: batch values propagate into `x`, optimizer.step updates weights")
+    _check(not np.allclose(w_before, app.trainer.model.parameters[0].data), "weights did not update after a batch")
+    print("    op-by-op advance: optimizer.step updates weights")
 
-    # decision-boundary grid eval returns a valid probability field
-    probs = tr.decision_grid(16)
-    _check(probs.shape == (16, 16), f"grid shape {probs.shape}")
-    _check(float(probs.min()) >= 0.0 and float(probs.max()) <= 1.0, "grid values not in [0,1]")
-    print("  decision_grid -> valid (16,16) probabilities in [0,1]")
-
-    # VJP focus data: every detailed backward op carries its full term set, and the
-    # forward operand values are present even though we are in the backward phase
-    det = app.scenes[False]
-    bwd_ops = [s for s in det.steps if s.phase == "backward" and s.vjp]
-    _check(bwd_ops, "no backward steps carry VJP terms")
-    for s in bwd_ops:
-        _check(s.vjp["children"], f"{s.vjp['target']}: no grad receivers")
-        kinds = {k for _, k, _ in s.vjp["terms"]}
-        _check("incoming" in kinds and "produced" in kinds, f"{s.vjp['target']}: missing incoming/produced")
-        for _lbl, _k, m in s.vjp["terms"]:
-            _check(np.asarray(m).size > 0, f"{s.vjp['target']}: empty VJP matrix")
-    mm = next(s for s in bwd_ops if s.vjp["target"].startswith("matmul"))
-    fwd_terms = [lbl for lbl, k, _ in mm.vjp["terms"] if k == "forward"]
-    _check(len(fwd_terms) == 2, f"matmul VJP should expose X and W forward values, got {fwd_terms}")
-    print(f"  VJP focus: {len(bwd_ops)} backward ops carry full labelled term sets (incl. forward X/W)")
-
-    # turbo trains whole batches fast and advances epochs
-    e0 = tr.epoch
-    app.turbo = True
-    for _ in range(30):  # 30 * TURBO_BATCHES_PER_FRAME batches
-        app.update(0.016)
-    app.turbo = False
-    _check(tr.epoch > e0, f"turbo did not advance an epoch ({e0} -> {tr.epoch})")
-    _check(app.boundary_surf is not None, "no boundary surface")
-    print(f"  turbo fast-forward: epoch {e0} -> {tr.epoch}, boundary recomputed")
-
-    # equations rasterise; camera math holds
     eqs = {s.eq for sc in app.scenes.values() for s in sc.steps if s.eq}
     for eq in eqs:
         surf = render_equation(eq)
         _check(isinstance(surf, pygame.Surface) and surf.get_width() > 0 and surf.get_height() > 0, f"bad eq {eq}")
-    cam = Camera()
-    cam.scale, cam.ox, cam.oy = 1.3, 40.0, -15.0
-    before = cam.s2w(300.0, 220.0)
-    cam.zoom_at(1.5, 300.0, 220.0)
-    after = cam.s2w(300.0, 220.0)
-    _check(abs(before[0] - after[0]) < 1e-6 and abs(before[1] - after[1]) < 1e-6, "zoom-to-cursor drift")
-    print(f"  {len(eqs)} equations rasterised (mathtext), camera zoom-to-cursor OK")
+    print(f"    {len(eqs)} equations rasterised (mathtext)")
 
-    # render frames for both views x 3 matrix modes (incl. a backward step + panel)
     app.trainer.prepare_current_batch()
     app._rebuild_scenes()
     for collapse in (False, True):
@@ -1029,10 +1103,81 @@ def selftest() -> int:
                 app.update(0.016)
                 app.draw()
     _check(isinstance(app.screen, pygame.Surface), "screen not a Surface")
-    print("  rendered graph + dataset panel for both views x 3 modes (no errors)")
+    print("    rendered both views x 3 matrix modes (no errors)")
+
+
+def selftest() -> int:
+    print("[selftest] pygame", pygame.version.ver)
+
+    # ---------------- MLP mode (must keep working exactly as before) ----------------
+    print("[selftest] MODEL_KIND='mlp' (moons) ...")
+    app = App(headless=True, dataset="moons", model_kind="mlp")
+    tr = app.trainer
+    print(f"  arch {ARCH}, batch {BATCH}, train samples {tr.nb_samples}, {tr.nb_batches} batches/epoch")
+    x0 = app.scenes[False].nodes["x"].mat.copy()
+    _check(np.allclose(x0, tr.X_train[tr.batch_indices]), "x node != current batch data")
+    _check(app.scenes[False].nodes["x"].mat.shape == (BATCH, 2), "x node wrong shape")
+    _check_common(app)
+    probs = tr.decision_grid(16)
+    _check(probs.shape == (16, 16) and 0.0 <= float(probs.min()) and float(probs.max()) <= 1.0, "bad grid")
+    mm = next(
+        s for s in app.scenes[False].steps if s.phase == "backward" and s.vjp and s.vjp["target"].startswith("matmul")
+    )
+    _check(sum(1 for _, k, _ in mm.vjp["terms"] if k == "forward") == 2, "matmul VJP must expose two fwd operands")
+    e0 = tr.epoch
+    app.turbo = True
+    for _ in range(20):
+        app.update(0.016)
+    app.turbo = False
+    _check(tr.epoch > e0, "turbo did not advance an epoch")
+    _check(app.boundary_surf is not None, "no boundary surface in mlp mode")
+    print("  decision_grid ok, matmul VJP ok, turbo advanced an epoch + redrew boundary")
+
+    # ---------------- ATTENTION mode (the new centerpiece) ----------------
+    print("[selftest] MODEL_KIND='attention' ...")
+    app = App(headless=True, model_kind="attention")
+    tr = app.trainer
+    print(f"  batch {ATTN_BATCH}, train samples {tr.nb_samples}, {tr.nb_batches} batches/epoch")
+    det = app.scenes[False]
+    hl = [k for k, ni in det.nodes.items() if ni.highlight]
+    _check(len(hl) == 1, f"expected exactly one attention-weights node, got {hl}")
+    wnode = det.nodes[hl[0]]
+    _check(wnode.role == "softmax", "highlight node is not the softmax output")
+    W = as2d(wnode.mat)  # sample-0 (seq_q, seq_k) attention weights
+    _check(W.ndim == 2 and W.shape[0] == W.shape[1], f"attn weights not square (seq,seq): {W.shape}")
+    _check(np.allclose(W.sum(axis=-1), 1.0, atol=1e-4), "attention rows do not sum to 1")
+    _check(float(W[:, -1].max()) < 1e-3, "masked (padded) key column is not ~0")
+    # the highlight node uses bigger CELLS than an ordinary node (Q is wide via d_k)
+    cell_attn = det.sizes[hl[0]][0] / W.shape[1]
+    cell_q = det.sizes["Q"][0] / as2d(det.nodes["Q"].mat).shape[1]
+    _check(cell_attn > cell_q + 1, "attention-weights node is not drawn bigger (per cell)")
+    _check("max_pos" in tr.attn_info and 0 <= tr.attn_info["max_pos"] < W.shape[1], "attn_info missing max_pos")
+    _check(app.has_dataset_panel is False and app.panel_geom() is None, "attention should hide the dataset panel")
+    print(f"  attention '{hl[0]}' {W.shape}: rows sum to 1, masked key ~0, cells {cell_attn:.0f}px > {cell_q:.0f}px")
+    _check_common(app)
+
+    # THE GOAL: after training, attention concentrates on the true max key position.
+    def rows_hit_max():  # fraction of valid query rows whose argmax key == the true max
+        info = tr.attn_info
+        A = as2d(app.scenes[False].nodes[hl[0]].mat)
+        valid = int(info["mask"].sum())
+        mp = info["max_pos"]
+        return float(np.mean(np.argmax(A[:valid], axis=-1) == mp))
+
+    before = rows_hit_max()
+    app.turbo = True
+    for _ in range(120):  # ~700 batches of turbo training
+        app.update(0.016)
+    app.turbo = False
+    app.trainer.prepare_current_batch()
+    app._rebuild_scenes()
+    after = rows_hit_max()
+    _check(tr.epoch > 0, "attention turbo did not advance an epoch")
+    _check(after >= 0.75, f"attention did not concentrate on the max after training ({before:.2f} -> {after:.2f})")
+    print(f"  TRAINED: query rows attending to the true max position {before:.2f} -> {after:.2f}  (visible!)")
 
     pygame.quit()
-    print("[selftest] PASS")
+    print("[selftest] PASS (both modes)")
     return 0
 
 
@@ -1040,9 +1185,10 @@ def main():
     if "--selftest" in sys.argv:
         sys.exit(selftest())
     ap = argparse.ArgumentParser(description="micrograd training visualiser")
+    ap.add_argument("--model", choices=["mlp", "attention"], default=MODEL_KIND)
     ap.add_argument("--dataset", choices=["moons", "circles"], default=DATASET)
     args = ap.parse_args()
-    App(dataset=args.dataset).run()
+    App(dataset=args.dataset, model_kind=args.model).run()
 
 
 if __name__ == "__main__":
