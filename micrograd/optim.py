@@ -6,6 +6,7 @@ from .tensor import Tensor
 
 
 class Optimizer(ABC):
+    lr: float
     parameters: list[Tensor]
 
     def zero_grad(self) -> None:
@@ -59,3 +60,19 @@ class Adam(Optimizer):
             v_hat = self.v[i] / (1 - self.beta_2**self.t)
 
             p.data -= self.lr * m_hat / (np.sqrt(v_hat) + self.epsilon)
+
+
+class LearningRateScheduler(ABC):
+    @abstractmethod
+    def step(self, epoch: int) -> None: ...
+
+
+class CosineDecayScheduler(LearningRateScheduler):
+    def __init__(self, optimizer: Optimizer, nb_epochs: int, lr_min: float = 0.0):
+        self.optimizer = optimizer
+        self.lr_0 = optimizer.lr
+        self.nb_epochs = nb_epochs
+        self.lr_min = lr_min
+
+    def step(self, epoch: int) -> None:
+        self.optimizer.lr = self.lr_min + 0.5 * (self.lr_0 - self.lr_min) * (1 + np.cos(np.pi * epoch / self.nb_epochs))
