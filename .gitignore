@@ -223,3 +223,6 @@ codecompanion-workspace.json
 .agents/scheduled_tasks.lock
 
 __marimo__/
+
+## Training outputs
+results_*.png
