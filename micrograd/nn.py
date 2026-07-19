@@ -89,6 +89,50 @@ class Attention(Module):
         return f"Attention ({self.nb_parameters} parameters, {self.d_k=}, {self.d_v=})"
 
 
+class AttentionScoreSummed(Module):
+    """
+    Attention scores without V — Q, K, masked softmax as in `Attention`, but
+    instead of aggregating V, sums the softmax weights over the query axis:
+
+        logit_i = sum_j attn[j, i]
+
+    Not real attention (no content transported, just a centrality score). Built
+    for the "find the max" classification demo: with a full `Attention` + linear
+    layer, the model reaches high accuracy without the softmax ever concentrating
+    on the true max — it routes around via V. Removing V forces logits to depend
+    directly on the attention weights, so the true max position must accumulate
+    the most attention — making the softmax matrix meaningful to inspect.
+
+    """
+
+    def __init__(self, n_in: int, d_k: int) -> None:
+        super().__init__()
+        self.d_k = d_k
+        # Xavier init
+        self.w_q = Tensor(np.random.randn(n_in, d_k) * np.sqrt(2.0 / (n_in + d_k)))
+        self.w_k = Tensor(np.random.randn(n_in, d_k) * np.sqrt(2.0 / (n_in + d_k)))
+
+    def __call__(self, x: Tensor, mask: np.ndarray | None = None) -> Tensor:
+        # x (batch, seq_len, n_in)
+        Q = x @ self.w_q  # (batch, seq_len, d_k)
+        K = x @ self.w_k  # (batch, seq_len, d_k)
+
+        if mask is not None:
+            b, s = mask.shape
+            QKt = Q @ K.swapaxes(-1, -2) + Tensor((1 - mask.reshape(b, 1, s)) * -1e9)
+        else:
+            QKt = Q @ K.swapaxes(-1, -2)
+
+        return softmax(QKt / np.sqrt(self.d_k), axis=-1).sum(axis=-2)
+
+    @property
+    def parameters(self) -> list[Tensor]:
+        return [self.w_k, self.w_q]
+
+    def __repr__(self) -> str:
+        return f"Attention ({self.nb_parameters} parameters, {self.d_k=})"
+
+
 class MeanPool(Module):
     def __call__(self, x: Tensor, mask: np.ndarray | None = None) -> Tensor:
 

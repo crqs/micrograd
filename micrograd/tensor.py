@@ -89,11 +89,16 @@ class Tensor:
 
         return out
 
-    def sum(self) -> Tensor:
-        out = Tensor(self.data.sum(), children={self})
+    def sum(self, axis: int | None = None) -> Tensor:
+        out = Tensor(self.data.sum(axis=axis), children={self})
 
         def _backward():
-            self.grad += np.ones_like(self.data) * out.grad
+            if axis is None:
+                g = out.grad
+            else:
+                g = np.expand_dims(out.grad, axis)
+
+            self.grad += np.ones_like(self.data) * g
 
         out.set_backward(_backward)
 
