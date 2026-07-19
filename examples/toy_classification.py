@@ -12,9 +12,6 @@ from micrograd.loss import binary_cross_entropy_with_logits
 from micrograd.nn import MLP
 from micrograd.optim import Adam
 
-# np.random.seed(42)
-# random.seed(42)
-
 
 def make_dataset(name: str, n_samples: int) -> tuple[np.ndarray, np.ndarray]:
     match name:

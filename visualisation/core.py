@@ -938,6 +938,7 @@ class AttentionTrainer:
             min_seq_len=self.MIN_SEQ_LEN,
             max_seq_len=self.MAX_SEQ_LEN,
             d_pos=self.D_POS,
+            mode="argmax" if self.task == "classification" else "max",
         )
         if self.task == "classification":
             from examples.attention.maximum_classification import MaxClassificationModel

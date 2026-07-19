@@ -9,12 +9,11 @@ from typing import cast
 import numpy as np
 from sklearn.model_selection import train_test_split
 
+from examples.attention.utils import fit, make_dataset, plot_results
 from micrograd import Tensor
 from micrograd.loss import mse
 from micrograd.nn import Attention, Linear, MeanPool, Module
 from micrograd.optim import Adam, CosineDecayScheduler
-
-from .utils import fit, make_dataset, plot_results
 
 SEED = 42
 
@@ -81,7 +80,14 @@ if __name__ == "__main__":
     HIGH = 100
     D_POS = 2
 
-    X, y, mask = make_dataset(n_samples=1_000, high=HIGH, min_seq_len=MIN_SEQ_LEN, max_seq_len=MAX_SEQ_LEN, d_pos=D_POS)
+    X, y, mask = make_dataset(
+        n_samples=1_000,
+        high=HIGH,
+        min_seq_len=MIN_SEQ_LEN,
+        max_seq_len=MAX_SEQ_LEN,
+        d_pos=D_POS,
+        mode="max",
+    )
 
     X_train, X_test_val, y_train, y_test_val, mask_train, mask_test_val = train_test_split(X, y, mask, test_size=0.3)
     X_test, X_val, y_test, y_val, mask_test, mask_val = train_test_split(
@@ -112,10 +118,10 @@ if __name__ == "__main__":
     results = fit(
         model=model,
         optimizer=(optimizer := Adam(parameters=model.parameters, lr=1e-3)),
-        lr_scheduler=CosineDecayScheduler(optimizer, nb_epochs),
+        lr_scheduler=None,
         criterion=mse,
         nb_epochs=nb_epochs,
-        batch_size=32,
+        batch_size=64,
         X_train=X_train,
         y_train=y_train,
         mask_train=mask_train,

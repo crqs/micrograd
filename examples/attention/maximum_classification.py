@@ -85,6 +85,7 @@ if __name__ == "__main__":
         min_seq_len=MIN_SEQ_LEN,
         max_seq_len=MAX_SEQ_LEN,
         d_pos=D_POS,
+        mode="argmax",
     )
 
     X_train, X_test_val, y_train, y_test_val, mask_train, mask_test_val = train_test_split(X, y, mask, test_size=0.3)

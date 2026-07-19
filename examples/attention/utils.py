@@ -26,6 +26,7 @@ def make_dataset(
     min_seq_len: int,
     max_seq_len: int,
     d_pos: int,
+    mode: Literal["max", "argmax"],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Generate sequences of variable length using masking, with a multi-frequency
@@ -50,7 +51,11 @@ def make_dataset(
     mask = positions[None, :] < seq_len[:, None]  # (n_samples, max_seq_len)
 
     X[~mask] = 0
-    y = np.argmax(X[:, :, 0], axis=1).reshape(-1, 1)
+    match mode:
+        case "max":
+            y = np.max(X[:, :, 0], axis=1).reshape(-1, 1)
+        case "argmax":
+            y = np.argmax(X[:, :, 0], axis=1).reshape(-1, 1)
 
     return X, y, mask.astype(np.float32)
 
@@ -152,8 +157,6 @@ def plot_results(
       parity plot (predicted vs true value), and examples annotate the predicted
       value against the true max.
     """
-    if task not in ("classification", "regression"):
-        raise ValueError(f"task must be 'classification' or 'regression', got {task!r}")
 
     fig = plt.figure(figsize=(15, 10), dpi=150)
     gs = fig.add_gridspec(2, 2, width_ratios=[1, 1.4], height_ratios=[1, 1])
@@ -203,7 +206,7 @@ def _plot_confusion(fig: Figure, ax: Axes, trues: np.ndarray, preds: np.ndarray,
     baseline_accuracy = float((trues == most_frequent_idx).mean())
 
     confusion = np.zeros((seq_len, seq_len), dtype=int)
-    for t, p in zip(trues, preds):
+    for t, p in zip(trues, preds, strict=True):
         confusion[t, p] += 1
 
     per_index_accuracy = np.full(seq_len, np.nan)
@@ -236,15 +239,15 @@ def _plot_confusion(fig: Figure, ax: Axes, trues: np.ndarray, preds: np.ndarray,
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     # small per-index accuracy annotation under the confusion matrix
-    per_idx_str = "  ".join(f"{i}:{a:.2f}" for i, a in enumerate(per_index_accuracy) if not np.isnan(a))
-    ax.text(
-        0,
-        seq_len + 1.2,
-        f"per true-idx accuracy:  {per_idx_str}",
-        fontsize=7,
-        ha="left",
-        transform=ax.transData,
-    )
+    # per_idx_str = "  ".join(f"{i}:{a:.2f}" for i, a in enumerate(per_index_accuracy) if not np.isnan(a))
+    # ax.text(
+    #     0,
+    #     seq_len + 1.2,
+    #     f"per true-idx accuracy:  {per_idx_str}",
+    #     fontsize=7,
+    #     ha="left",
+    #     transform=ax.transData,
+    # )
 
 
 def _plot_parity(ax: Axes, trues: np.ndarray, preds: np.ndarray) -> None:
