@@ -3,6 +3,28 @@ from numpy.testing import assert_array_equal
 
 from micrograd import Tensor
 
+from tests.utils import gradcheck
+
+
+def test_gradient_add():
+    x = Tensor(
+        np.array(
+            [
+                [-4.0, 2.0],
+                [1.0, 1.0],
+            ]
+        )
+    )
+    y = Tensor(
+        np.array(
+            [
+                [1.0, -3.0],
+                [2.0, 0.0],
+            ]
+        )
+    )
+    gradcheck(lambda x: x + y, x)
+
 
 def test_backward_add():
     x = Tensor(

@@ -5,6 +5,8 @@ from numpy.testing import assert_allclose, assert_array_equal
 from micrograd import Tensor
 from micrograd.operations import sigmoid, softmax
 
+from tests.utils import gradcheck
+
 
 def test_backward_sigmoid():
     x = Tensor(
@@ -63,6 +65,20 @@ def test_backward_softmax():
     assert_array_equal(
         x.grad,  # dL/dx = softmax(x) * (dL/dz - sum(dL/dz * softmax(x)))
         expected_data * (z.grad - dot),
+    )
+
+
+def test_gradient_softmax():
+    gradcheck(
+        softmax,
+        Tensor(
+            np.array(
+                [
+                    [1.0, 2.0, 0.5],
+                    [0.1, -1.0, 3.0],
+                ]
+            )
+        ),
     )
 
 
