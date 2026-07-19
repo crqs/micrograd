@@ -107,8 +107,10 @@ class Tensor:
         out = Tensor(np.multiply(self.data, other.data), children={self, other})
 
         def _backward():
-            self.grad += other.data * self._unbroadcast(out.grad, self.grad.shape)
-            other.grad += self.data * self._unbroadcast(out.grad, other.grad.shape)
+            # self.grad += other.data * self._unbroadcast(out.grad, self.grad.shape)
+            # other.grad += self.data * self._unbroadcast(out.grad, other.grad.shape)
+            self.grad += self._unbroadcast(other.data * out.grad, self.grad.shape)
+            other.grad += self._unbroadcast(self.data * out.grad, other.grad.shape)
 
         out.set_backward(_backward)
 

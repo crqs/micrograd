@@ -15,7 +15,7 @@ def log(x: Tensor) -> Tensor:
 
 
 def sigmoid(x: Tensor) -> Tensor:
-    out = Tensor(1 / (1 + np.exp(-x.data)))
+    out = Tensor(1 / (1 + np.exp(-x.data)), children={x})
 
     def _backward():
         x.grad += out.grad * out.data * (1 - out.data)
@@ -27,7 +27,7 @@ def sigmoid(x: Tensor) -> Tensor:
 
 def softmax(x: Tensor, axis: int = -1) -> Tensor:
     e = np.exp(x.data - np.max(x.data, axis=axis, keepdims=True))
-    out = Tensor(e / np.sum(e, axis=axis, keepdims=True))
+    out = Tensor(e / np.sum(e, axis=axis, keepdims=True), children={x})
 
     def _backward():
         dot = np.sum(out.grad * out.data, axis=-1, keepdims=True)

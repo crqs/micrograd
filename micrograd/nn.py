@@ -67,11 +67,7 @@ class Attention(Module):
         self.w_k = Tensor(np.random.randn(n_in, d_k) * np.sqrt(2.0 / (n_in + d_k)))
         self.w_v = Tensor(np.random.randn(n_in, d_v) * np.sqrt(2.0 / (n_in + d_v)))
 
-    def __call__(
-        self,
-        x: Tensor,
-        mask: np.ndarray | None = None,
-    ) -> Tensor:
+    def __call__(self, x: Tensor, mask: np.ndarray | None = None) -> Tensor:
         # x (batch, seq_len, n_in)
         Q = x @ self.w_q  # (batch, seq_len, d_k)
         K = x @ self.w_k  # (batch, seq_len, d_k)
@@ -80,7 +76,6 @@ class Attention(Module):
         if mask is not None:
             b, s = mask.shape
             QKt = Q @ K.swapaxes(-1, -2) + Tensor((1 - mask.reshape(b, 1, s)) * -1e9)
-            # QKt = Q @ K.swapaxes(-1, -2) + Tensor((1 - mask[:, None, :]) * -1e9)
         else:
             QKt = Q @ K.swapaxes(-1, -2)
 
