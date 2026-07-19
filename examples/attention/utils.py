@@ -20,6 +20,59 @@ if TYPE_CHECKING:
 Task = Literal["classification", "regression"]
 
 
+def make_dataset(
+    n_samples: int,
+    high: int,
+    min_seq_len: int,
+    max_seq_len: int,
+    d_pos: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate sequences of variable length using masking, with a multi-frequency
+    sinusoidal positional encoding concatenated to each token's value.
+
+    Each token has shape (1 + d_pos,): its raw value, followed by d_pos positional
+    encoding dimensions (pairs of sin/cos at different frequencies), so the attention
+    mechanism can discriminate between positions, not just between values.
+
+    Returns:
+        X: (n_samples, max_seq_len, 1 + d_pos) — token features, padded with zeros.
+        y: (n_samples, 1) — index of the max value within each sequence.
+        mask: (n_samples, max_seq_len) — 1.0 for valid positions, 0.0 for padding.
+    """
+    X = np.random.randint(low=0, high=high, size=(n_samples, max_seq_len, 1 + d_pos)).astype(float)
+    seq_len = np.random.randint(low=min_seq_len, high=max_seq_len, size=n_samples)  # (n_samples,)
+    positions = np.arange(max_seq_len)  # (max_seq_len,)
+
+    pe = _positional_encoding(max_seq_len, d_pos)  # (max_seq_len, d_pos)
+    X[:, :, 1:] = pe[None, :, :]  # broadcast the same positional encoding to every sample
+
+    mask = positions[None, :] < seq_len[:, None]  # (n_samples, max_seq_len)
+
+    X[~mask] = 0
+    y = np.argmax(X[:, :, 0], axis=1).reshape(-1, 1)
+
+    return X, y, mask.astype(np.float32)
+
+
+def _positional_encoding(max_seq_len: int, d_pos: int, base: float | None = None) -> np.ndarray:
+    """Multi-frequency sinusoidal positional encoding"""
+    if d_pos % 2 != 0:
+        raise ValueError("d_pos must be even (pairs of sin/cos)")
+    if base is None:
+        base = max(max_seq_len, 2)
+
+    positions = np.arange(max_seq_len).reshape(-1, 1)  # (max_seq_len, 1)
+    i = np.arange(d_pos // 2).reshape(1, -1)  # (1, d_pos/2)
+    freqs = 1.0 / (base ** (2 * i / d_pos))  # (1, d_pos/2)
+    angles = positions * freqs  # (max_seq_len, d_pos/2)
+
+    pe = np.zeros((max_seq_len, d_pos))
+    pe[:, 0::2] = np.sin(angles)
+    pe[:, 1::2] = np.cos(angles)
+    return pe
+
+
 def fit(
     model: MaxClassificationModel | MaxRegressionModel,
     optimizer: Optimizer,
@@ -260,9 +313,7 @@ def _plot_classification_examples(
                 edge_color, lw = "black", 0.8
 
             ax.scatter(j, y, s=380, c="white", edgecolors=edge_color, linewidths=lw, zorder=2)
-            ax.text(
-                j, y, str(int(v)), ha="center", va="center", fontsize=8, zorder=3, color="black", fontweight="bold"
-            )
+            ax.text(j, y, str(int(v)), ha="center", va="center", fontsize=8, zorder=3, color="black", fontweight="bold")
 
         status_color = "#2e7d32" if correct else "#c62828"
         status = "correct" if correct else "wrong"
@@ -316,9 +367,7 @@ def _plot_regression_examples(
                 continue
             edge_color, lw = ("crimson", 2.4) if j == true_pos else ("black", 0.8)
             ax.scatter(j, y, s=380, c="white", edgecolors=edge_color, linewidths=lw, zorder=2)
-            ax.text(
-                j, y, str(int(v)), ha="center", va="center", fontsize=8, zorder=3, color="black", fontweight="bold"
-            )
+            ax.text(j, y, str(int(v)), ha="center", va="center", fontsize=8, zorder=3, color="black", fontweight="bold")
 
         err = abs(pred_val - true_val)
         ax.text(seq_len + 0.3, y, f"true {true_val:.0f}", ha="left", va="center", fontsize=9)

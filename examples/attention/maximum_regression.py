@@ -14,43 +14,12 @@ from micrograd.loss import mse
 from micrograd.nn import Attention, Linear, MeanPool, Module
 from micrograd.optim import Adam, CosineDecayScheduler
 
-from .utils import fit, plot_results
+from .utils import fit, make_dataset, plot_results
 
 SEED = 42
 
 np.random.seed(SEED)
 random.seed(SEED)
-
-
-def make_dataset(
-    n_samples: int,
-    high: int,
-    min_seq_len: int,
-    max_seq_len: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Generate sequences of variable length using masking, with a multi-frequency
-    sinusoidal positional encoding concatenated to each token's value.
-
-    Each token has shape (1 + d_pos,): its raw value, followed by d_pos positional
-    encoding dimensions (pairs of sin/cos at different frequencies), so the attention
-    mechanism can discriminate between positions, not just between values.
-
-    Returns:
-        X: (n_samples, max_seq_len, 1 + d_pos) — token features, padded with zeros.
-        y: (n_samples, 1) — index of the max value within each sequence.
-        mask: (n_samples, max_seq_len) — 1.0 for valid positions, 0.0 for padding.
-    """
-    X = np.random.randint(low=0, high=high, size=(n_samples, max_seq_len, 1)).astype(float)
-    seq_len = np.random.randint(low=min_seq_len, high=max_seq_len, size=n_samples)  # (n_samples,)
-    positions = np.arange(max_seq_len)  # (max_seq_len,)
-
-    mask = positions[None, :] < seq_len[:, None]  # (n_samples, max_seq_len)
-
-    X[~mask] = 0
-    y = np.max(X[:, :, 0], axis=1).reshape(-1, 1)
-
-    return X, y, mask.astype(np.float32)
 
 
 class MaxRegressionModel(Module):
@@ -110,13 +79,9 @@ if __name__ == "__main__":
     MAX_SEQ_LEN = 20
     MIN_SEQ_LEN = 5
     HIGH = 100
+    D_POS = 2
 
-    X, y, mask = make_dataset(
-        n_samples=1_000,
-        high=HIGH,
-        min_seq_len=MIN_SEQ_LEN,
-        max_seq_len=MAX_SEQ_LEN,
-    )
+    X, y, mask = make_dataset(n_samples=1_000, high=HIGH, min_seq_len=MIN_SEQ_LEN, max_seq_len=MAX_SEQ_LEN, d_pos=D_POS)
 
     X_train, X_test_val, y_train, y_test_val, mask_train, mask_test_val = train_test_split(X, y, mask, test_size=0.3)
     X_test, X_val, y_test, y_val, mask_test, mask_val = train_test_split(
@@ -134,7 +99,7 @@ if __name__ == "__main__":
     mask_test = cast(np.ndarray, mask_test)
 
     model = MaxRegressionModel(
-        n_in=1,
+        n_in=1 + D_POS,
         d_k=16,
         d_v=16,
         hidden_dims=[16, 16],
